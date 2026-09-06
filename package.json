@@ -1,0 +1,12 @@
+{
+  "name": "obsidian-vault-git-sync-desktop",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Desktop Obsidian Git sync companion for VaultBridge",
+  "license": "MIT",
+  "scripts": {
+    "lint": "node --check main.js && node --check test/sync.test.cjs",
+    "build": "node scripts/validate.cjs",
+    "test": "node --test test/*.test.cjs"
+  }
+}
