@@ -34,8 +34,10 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-git-sync-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = path.join(dir, 'empty.gitconfig');
+  fs.writeFileSync(config, '');
   const git = (cwd, ...args) => cp.execFileSync('git', args, { cwd,
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config },
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const remote = path.join(dir, 'remote.git');
   const vault = path.join(dir, 'vault');
@@ -43,6 +45,7 @@ function fixture(t) {
   git(dir, 'clone', remote, vault);
   git(vault, 'config', 'user.name', 'Test');
   git(vault, 'config', 'user.email', 'test@example.invalid');
+  git(vault, 'config', 'core.autocrlf', 'false');
   fs.writeFileSync(path.join(vault, 'note.md'), 'original\n');
   git(vault, 'add', '.');
   git(vault, 'commit', '-m', 'Initial');

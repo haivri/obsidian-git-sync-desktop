@@ -75,9 +75,9 @@ filesystem allocation are local to each device. Git sync does not replace backup
 
 No dependencies or transpilation are required. Run `npm run lint`, `npm test`,
 and `npm run build`. Tests use temporary local Git repositories and mocked
-Obsidian UI, never a real vault or remote account. macOS is locally verified;
-Windows and Linux command routing is covered by tests but has not yet received
-native OS or Obsidian UI testing.
+Obsidian UI, never a real vault or remote account. CI runs the suite on macOS,
+Windows, and Linux; check the Actions results for the release commit. Obsidian
+UI testing is performed locally on macOS.
 
 Publish the same clean source commit to private Forgejo and public GitHub, then
 deploy runtime artifacts into each local vault while preserving `data.json`.
