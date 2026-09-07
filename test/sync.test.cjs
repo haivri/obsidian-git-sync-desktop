@@ -11,7 +11,34 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 function load({ home, vault, platform = process.platform, mobile = false, execute } = {}) {
   const notices = [];
   const commands = [];
-  class Plugin { addCommand(c) { commands.push(c); } addRibbonIcon() {} }
+  const tabs = [];
+  const buttons = [];
+  const modals = [];
+  class Element {
+    children = []; attributes = {}; textContent = '';
+    empty() { this.children = []; }
+    addClass() {}
+    setAttribute(key, value) { this.attributes[key] = value; }
+    createEl(tag, options = {}) { const el = new Element(); el.textContent = options.text || ''; this.children.push(el); return el; }
+    createDiv(options) { return this.createEl('div', options); }
+  }
+  class Modal {
+    constructor() { this.contentEl = new Element(); modals.push(this); }
+    setTitle() {}
+    open() { this.onOpen(); }
+    close() { this.onClose(); }
+  }
+  class PluginSettingTab { constructor() { this.containerEl = new Element(); } }
+  class Setting {
+    constructor(container) { this.settingEl = container; }
+    setName() { return this; } setDesc() { return this; }
+    addButton(fn) {
+      const button = { setButtonText(text) { this.text = text; return this; }, setCta() { return this; },
+        onClick(callback) { this.callback = callback; return this; }, setDisabled(disabled) { this.disabled = disabled; return this; } };
+      buttons.push(button); fn(button); return this;
+    }
+  }
+  class Plugin { addCommand(c) { commands.push(c); } addRibbonIcon() {} addSettingTab(tab) { tabs.push(tab); } }
   class Notice {
     constructor(message) { notices.push(message); }
     setMessage(message) { notices.push(message); }
@@ -20,7 +47,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
   const context = { module: { exports: {} }, process: { platform,
     env: { ...process.env, LOCALAPPDATA: home, XDG_STATE_HOME: home } },
     require(name) {
-      if (name === 'obsidian') return { Plugin, Notice, Platform: { isMobile: mobile } };
+      if (name === 'obsidian') return { Plugin, Notice, Modal, PluginSettingTab, Setting, Platform: { isMobile: mobile } };
       if (name === 'node:os') return { homedir: () => home };
       if (name === 'node:child_process' && execute) return { execFile: execute };
       return require(name);
@@ -28,7 +55,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
   vm.runInNewContext(source, context);
   const instance = new context.module.exports();
   instance.app = { vault: { adapter: { getBasePath: () => vault } } };
-  return { instance, notices, commands };
+  return { instance, notices, commands, tabs, buttons, modals };
 }
 
 function fixture(t) {
@@ -166,3 +193,134 @@ for (const platform of ['darwin', 'win32', 'linux']) {
     if (platform === 'darwin') assert.ok(calls[0].options.env.PATH.startsWith('/opt/homebrew/bin:/usr/local/bin:'));
   });
 }
+
+function makePeer({ dir, vault, remote, git }) {
+  const peer = path.join(dir, 'peer');
+  git(dir, 'clone', remote, peer);
+  git(peer, 'config', 'user.name', 'Peer'); git(peer, 'config', 'user.email', 'peer@example.invalid');
+  return peer;
+}
+
+test('manual local commit works without a remote and never uploads', async (t) => {
+  const f = fixture(t);
+  const server = f.git(f.remote, 'rev-parse', 'main');
+  f.git(f.vault, 'remote', 'remove', 'origin');
+  fs.writeFileSync(path.join(f.vault, 'offline.md'), 'offline work\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.runAction('commit'), true, instance.feedback);
+  assert.match(instance.feedback, /Nothing uploaded/);
+  assert.equal(f.git(f.vault, 'show', 'HEAD:offline.md'), 'offline work');
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+});
+
+test('manual pull receives server commits without uploading or committing local edits', async (t) => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'server.md'), 'server work\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  const server = f.git(f.remote, 'rev-parse', 'main');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  fs.writeFileSync(path.join(f.vault, 'draft.md'), 'draft\n');
+  const before = f.git(f.vault, 'rev-parse', 'HEAD');
+  assert.equal(await instance.runAction('pull'), false);
+  assert.equal(f.git(f.vault, 'rev-parse', 'HEAD'), before);
+  fs.unlinkSync(path.join(f.vault, 'draft.md'));
+  assert.equal(await instance.runAction('pull'), true, instance.feedback);
+  assert.equal(f.git(f.vault, 'rev-parse', 'HEAD'), server);
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+});
+
+test('manual merge saves both sides locally; push is a separate verified action', async (t) => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'server.md'), 'server work\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  const server = f.git(f.remote, 'rev-parse', 'main');
+  fs.writeFileSync(path.join(f.vault, 'computer.md'), 'computer work\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.runAction('merge'), true, instance.feedback);
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'server.md'), 'utf8'), 'server work\n');
+  assert.equal(fs.readFileSync(path.join(f.vault, 'computer.md'), 'utf8'), 'computer work\n');
+  assert.match(f.git(f.vault, 'for-each-ref', '--format=%(refname)', 'refs/vault-git-sync/checkpoints'), /checkpoints/);
+  assert.equal(await instance.runAction('push'), true, instance.feedback);
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), f.git(f.vault, 'rev-parse', 'HEAD'));
+});
+
+for (const preference of ['ours', 'theirs']) {
+  test(`force merge prefers ${preference}, preserves both histories and checkpoint, never uploads`, async (t) => {
+    const f = fixture(t); const peer = makePeer(f);
+    fs.writeFileSync(path.join(peer, 'note.md'), 'server choice\n');
+    fs.writeFileSync(path.join(peer, 'server-only.md'), 'keep server\n');
+    f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+    const server = f.git(f.remote, 'rev-parse', 'main');
+    fs.writeFileSync(path.join(f.vault, 'note.md'), 'computer choice\n');
+    fs.writeFileSync(path.join(f.vault, 'computer-only.md'), 'keep computer\n');
+    const { instance } = load({ home: f.dir, vault: f.vault });
+    assert.equal(await instance.runAction('force', { preference }), true, instance.feedback);
+    assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), preference === 'ours' ? 'computer choice\n' : 'server choice\n');
+    assert.ok(fs.existsSync(path.join(f.vault, 'server-only.md')));
+    assert.ok(fs.existsSync(path.join(f.vault, 'computer-only.md')));
+    assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+    f.git(f.vault, 'merge-base', '--is-ancestor', server, 'HEAD');
+    const checkpoint = f.git(f.vault, 'for-each-ref', '--format=%(objectname)', 'refs/vault-git-sync/checkpoints');
+    assert.equal(f.git(f.vault, 'show', `${checkpoint}:note.md`), 'computer choice');
+    assert.equal(await instance.runAction('force', { preference: 'invalid' }), false);
+  });
+}
+
+test('status recommends merging divergence without altering local files; push refuses newer server work', async (t) => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'server.md'), 'server\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, 'computer.md'), 'computer\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  await instance.runAction('commit');
+  const before = f.git(f.vault, 'rev-parse', 'HEAD'); const server = f.git(f.remote, 'rev-parse', 'main');
+  assert.equal(await instance.runAction('status'), true, instance.feedback);
+  assert.match(instance.feedback, /1 saved commits to upload; 1 server commits to receive/);
+  assert.match(instance.feedback, /combine computer and server/);
+  assert.equal(await instance.runAction('push'), false);
+  assert.equal(await instance.runAction('pull'), false);
+  assert.equal(f.git(f.vault, 'rev-parse', 'HEAD'), before);
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+});
+
+test('conflicts require resolution before finish; finishing creates only a local merge', async (t) => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'server\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  const server = f.git(f.remote, 'rev-parse', 'main');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'computer\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.runAction('merge'), false);
+  assert.equal(await instance.runAction('finish'), false);
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'reviewed combined text\n');
+  f.git(f.vault, 'add', 'note.md');
+  assert.equal(await instance.runAction('finish'), true, instance.feedback);
+  assert.equal(f.git(f.vault, 'status', '--porcelain'), '');
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+});
+
+test('manual settings wire every action, show persistent feedback, and confirm force preferences', async () => {
+  const { instance, tabs, buttons, modals } = load();
+  instance.onload();
+  tabs[0].display();
+  const calls = [];
+  instance.runAction = async (...args) => { calls.push(args); return true; };
+  for (const [label, action] of [['Commit locally', 'commit'], ['Pull', 'pull'], ['Merge', 'merge'], ['Push', 'push'], ['Check status', 'status'], ['Finish merge', 'finish'], ['Sync now', 'sync']]) {
+    await buttons.find(button => button.text === label).callback();
+    assert.equal(calls.at(-1)[0], action);
+  }
+  const count = calls.length;
+  buttons.find(button => button.text === 'Choose preference…').callback();
+  assert.equal(calls.length, count, 'opening confirmation cannot merge');
+  buttons.find(button => button.text === 'Merge — prefer server').callback();
+  assert.equal(calls.at(-1)[0], 'force');
+  assert.equal(calls.at(-1)[1].preference, 'theirs');
+  instance.syncing = true;
+  instance.report('Uploading changes…');
+  assert.ok(buttons.slice(0, 8).every(button => button.disabled));
+  assert.ok(tabs[0].containerEl.children.some(el => el.textContent === 'Uploading changes…'));
+  tabs[0].hide();
+  assert.equal(instance.listeners.size, 0);
+  assert.equal(modals.length, 1);
+});

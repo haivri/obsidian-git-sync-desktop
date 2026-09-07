@@ -25,7 +25,7 @@ community directory.
    Confirm you can fetch and push from a terminal first.
 4. Download `main.js` and `manifest.json` from the
    [latest release](https://github.com/haivri/obsidian-vault-git-sync-desktop/releases/latest).
-   Put both in `<vault>/.obsidian/plugins/vault-git-sync/`. Alternatively, extract
+   Also download `styles.css` and put all three files in `<vault>/.obsidian/plugins/vault-git-sync/`. Alternatively, extract
    `vault-git-sync.zip` into `<vault>/.obsidian/plugins/`.
 5. Restart Obsidian, allow community plugins, and enable **Vault Git Sync (Desktop)**.
 6. Click the Git merge ribbon icon. Progress and any failure appear in Obsidian.
@@ -44,8 +44,9 @@ the legacy watcher and shortcut share its lock.
 - Only one cooperating local sync runs at a time. Existing merge/rebase recovery
   states stop sync before staging. A forcibly stopped process can leave a lock;
   it is never removed automatically while another sync may still be running.
-- Conflicts stay visible for manual resolution. No force push, automatic conflict
-  resolution, reset, or implicit autostash is performed.
+- Normal sync and merge leave conflicts visible for manual resolution. The explicit
+  advanced force-merge action can prefer one side for conflicts. No force push, reset,
+  or implicit autostash is performed.
 - Mobile is excluded by the manifest and runtime guard. iPhone sync is handled
   by VaultBridge. A vault copied to Windows must use Windows-compatible filenames.
 
@@ -82,8 +83,38 @@ UI testing is performed locally on macOS.
 Publish the same clean source commit to private Forgejo and public GitHub, then
 deploy runtime artifacts into each local vault while preserving `data.json`.
 Tag releases with the manifest version (e.g. `1.2.0`) and attach `main.js`,
-`manifest.json`, and `vault-git-sync.zip`. Never publish vault content, credentials,
+`manifest.json`, `styles.css`, and `vault-git-sync.zip`. Never publish vault content, credentials,
 or machine-specific configuration.
 
 MIT licensed. This independently implemented plugin contains no VaultBridge
 or GitSync.md application code.
+
+## Manual Git tools (1.3.0)
+
+Open **Settings → Vault Git Sync → Manual Git actions**, or the command
+**Open manual Git tools**. The ribbon still runs the familiar complete sync.
+Every action shows live progress, a result, and actionable failure details.
+Buttons are disabled while another operation is running.
+
+| Button | What it does | Uploads? |
+| --- | --- | --- |
+| Check status | Fetches the latest server history and recommends the next step. Leaves note files unchanged. | No |
+| Commit locally | Stages all unignored changes, including deletions, and saves a local checkpoint. Works without a remote. | No |
+| Pull | Receives server changes only when local files are saved and there are no competing local commits. | No |
+| Merge | Checks the server, saves local edits, protects the local commit, and combines both histories. Conflicts stop for review. | No |
+| Push | Uploads existing saved commits after checking for newer server work. Does not commit unsaved edits. | Yes |
+| Finish merge | Commits a merge after you resolve and stage conflicts in a Git client. | No |
+| Sync now | Saves locally, merges server changes, then uploads and verifies. | Yes |
+
+**Advanced → Force merge** opens a confirmation dialog. Choose whether the
+computer or server wins conflicting text edits; Git retains non-conflicting
+changes from both histories. For binary conflicts, Git selects the whole file
+from that side. Some conflicts still require manual resolution. The action
+never force-pushes, resets the vault, or bypasses an unfinished Git operation.
+
+Manual Merge and Force merge protect the pre-merge local checkpoint under
+`refs/vault-git-sync/checkpoints/` and display its short commit ID. These refs
+keep the checkpoint reachable for recovery in a Git client. Server history is
+also retained through the merge; nothing uploads until you choose Push.
+If files keep changing while a checkpoint is being created, the action stops
+so you can let editing settle and retry.

@@ -1,0 +1,20 @@
+.vault-git-sync-tools { display: block; min-width: 0; }
+.vault-git-sync-feedback {
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 12px;
+}
+.vault-git-sync-tools .setting-item { gap: 16px; }
+.vault-git-sync-tools .setting-item-control { flex-shrink: 0; }
+.vault-git-sync-tools button { min-width: 120px; min-height: 40px; }
+.vault-git-sync-advanced { margin-top: 16px; }
+.vault-git-sync-advanced summary { cursor: pointer; padding-block: 8px; }
+@media (max-width: 600px) {
+  .vault-git-sync-tools .setting-item { flex-direction: column; align-items: stretch; }
+  .vault-git-sync-tools .setting-item-control { justify-content: stretch; }
+  .vault-git-sync-tools button { width: 100%; }
+}
