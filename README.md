@@ -1,7 +1,5 @@
 # Git Sync Desktop
 
-<a href="https://www.buymeacoffee.com/robertfleming"><img src="assets/buy-me-a-coffee.png" alt="Buy me a coffee" width="217"></a>
-
 An Obsidian plugin for synchronizing a vault with Git on **macOS, Windows, and
 Linux**. Use the ribbon button or **Git Sync Desktop: Sync vault with Git**
 in the command palette. It saves a local commit, merges server updates without
@@ -12,6 +10,17 @@ for iPhone. Both use your own repository. No VaultBridge service is required;
 GitHub, Forgejo/Gitea, and other Git hosts work through your existing Git setup.
 This plugin is distributed on GitHub and has not been submitted to the Obsidian
 community directory.
+
+## Features
+
+- One-click sync from the ribbon or command palette.
+- Separate Commit locally, Pull, Merge, and Push controls with plain-language explanations.
+- Persistent progress, status, and failure feedback.
+- Git LFS support and compatibility with your existing Git credentials and remote.
+- Conflict checkpoints and explicit confirmation for advanced merge choices.
+- Runs on macOS, Windows, and Linux; pairs with VaultBridge on iPhone.
+
+<a href="https://www.buymeacoffee.com/robertfleming"><img src="assets/buy-me-a-coffee.png" alt="Buy me a coffee" width="217"></a>
 
 ## See it in action
 
