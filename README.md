@@ -1,5 +1,7 @@
 # Vault Git Sync (Desktop)
 
+<a href="https://www.buymeacoffee.com/robertfleming"><img src="assets/buy-me-a-coffee.png" alt="Buy me a coffee" width="217"></a>
+
 An Obsidian plugin for synchronizing a vault with Git on **macOS, Windows, and
 Linux**. Use the ribbon button or **Vault Git Sync (Desktop): Sync vault with Git**
 in the command palette. It saves a local commit, merges server updates without
@@ -10,6 +12,16 @@ for iPhone. Both use your own repository. No VaultBridge service is required;
 GitHub, Forgejo/Gitea, and other Git hosts work through your existing Git setup.
 This plugin is distributed on GitHub and has not been submitted to the Obsidian
 community directory.
+
+## See it in action
+
+### Manual Git tools
+
+Save, pull, merge, and push with plain-language explanations and persistent sync feedback.
+
+<p align="center">
+  <img src="screenshots/01-manual-tools.png" alt="Save, pull, merge, and push with plain-language explanations and persistent sync feedback." width="900">
+</p>
 
 ## Install
 
@@ -118,3 +130,15 @@ keep the checkpoint reachable for recovery in a Git client. Server history is
 also retained through the merge; nothing uploads until you choose Push.
 If files keep changing while a checkpoint is being created, the action stops
 so you can let editing settle and retry.
+
+## Screenshot demo
+
+A [ready-to-use screenshot kit](bootstrap/README.md) includes demo notes and capture instructions.
+
+## Acknowledgements
+
+Robert Fleming directed and reviewed this work. Recent refinements, documentation, and screenshot preparation were developed in collaboration with OpenAI Codex, powered by GPT-6. Thank you to the AI collaborators who helped bring these ideas into a usable community plugin.
+
+## Feedback
+
+Bug reports are welcome in this repository’s issue tracker when available. Include your Obsidian and plugin versions, desktop or mobile, a short reproduction, and expected versus actual behavior. Use a small sample note without personal content. This is a spare-time project; fixes and replies have no guaranteed schedule. Contributions and forks are welcome; donations are optional.
