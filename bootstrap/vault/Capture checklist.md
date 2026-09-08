@@ -14,7 +14,7 @@ Open these notes from `Plugin Showcase`. Enable the relevant plugins; Simple Gal
 | note-lock/screenshots | 01-notion-style-lock.png | Note Lock - A protected routine, Live Preview | Header lock and readable routine. Keep Show lock banner off for the clean default presentation. |
 | note-lock/screenshots | 02-mobile-lock.png | Same note on mobile | Header lock below the safe area; normal toolbar/title spacing and unobstructed content. |
 | yaml-properties/screenshots | 01-expanded.png | YAML - Practice journal; expand properties | Readable raw YAML above the journal, including list, boolean, and nested resource data. |
-| vault-git-sync/screenshots | 01-manual-tools.png | Open manual Git tools or plugin settings | Plain explanations paired with traditional Git button labels. No operation needs to run. |
+| git-sync-desktop/screenshots | 01-manual-tools.png | Open manual Git tools or plugin settings | Plain explanations paired with traditional Git button labels. No operation needs to run. |
 
 ## Optional supporting shots
 
@@ -23,7 +23,7 @@ Open these notes from `Plugin Showcase`. Enable the relevant plugins; Simple Gal
 - Fullscreen Image: `05-mobile-viewer.png`, with image navigation and pinch zoom checked. Retain existing README images until new ones are approved.
 - Note Lock: `03-banner-optional.png`, temporarily enable Show lock banner, then restore your previous preference. A short GIF/video can demonstrate a checkbox refusing a change, followed by header unlock and a successful edit. Re-lock afterward. A still alone does not prove protection. This is accidental-edit protection, not encryption or access control.
 - YAML Properties: `02-collapsed.png` from the same note, showing more room for writing.
-- Vault Git Sync: `02-status-feedback.png` only if you voluntarily run Check status with your normal configured remote. Crop private details. Do not run Force merge or change real notes just to get a screenshot.
+- Git Sync Desktop: `02-status-feedback.png` only if you voluntarily run Check status with your normal configured remote. Crop private details. Do not run Force merge or change real notes just to get a screenshot.
 
 ## Before calling the mobile shots done
 

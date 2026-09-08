@@ -1,9 +1,9 @@
-# Vault Git Sync (Desktop)
+# Git Sync Desktop
 
 <a href="https://www.buymeacoffee.com/robertfleming"><img src="assets/buy-me-a-coffee.png" alt="Buy me a coffee" width="217"></a>
 
 An Obsidian plugin for synchronizing a vault with Git on **macOS, Windows, and
-Linux**. Use the ribbon button or **Vault Git Sync (Desktop): Sync vault with Git**
+Linux**. Use the ribbon button or **Git Sync Desktop: Sync vault with Git**
 in the command palette. It saves a local commit, merges server updates without
 rebasing, uploads, and checks that the server and computer have the same commit.
 
@@ -36,13 +36,13 @@ Save, pull, merge, and push with plain-language explanations and persistent sync
    remote and a checked-out branch. The matching branch must exist on the server.
    Confirm you can fetch and push from a terminal first.
 4. Download `main.js` and `manifest.json` from the
-   [latest release](https://github.com/haivri/obsidian-vault-git-sync-desktop/releases/latest).
-   Also download `styles.css` and put all three files in `<vault>/.obsidian/plugins/vault-git-sync/`. Alternatively, extract
-   `vault-git-sync.zip` into `<vault>/.obsidian/plugins/`.
-5. Restart Obsidian, allow community plugins, and enable **Vault Git Sync (Desktop)**.
+   [latest release](https://github.com/haivri/obsidian-git-sync-desktop/releases/latest).
+   Also download `styles.css` and put all three files in `<vault>/.obsidian/plugins/git-sync-desktop/`. Alternatively, extract
+   `git-sync-desktop.zip` into `<vault>/.obsidian/plugins/`.
+5. Restart Obsidian, allow community plugins, and enable **Git Sync Desktop**.
 6. Click the Git merge ribbon icon. Progress and any failure appear in Obsidian.
 
-The internal ID stays `vault-git-sync` so existing installations upgrade in place.
+The plugin ID is now `git-sync-desktop` (previously `vault-git-sync`). Existing users should disable the old plugin, move its settings into the new plugin folder, enable Git Sync Desktop, and update any command hotkeys. Do not enable both copies. The repository includes `scripts/migrate-install.py` to preserve the old installation and migrate settings, enabled state, and hotkeys before installing the new runtime. Restart Obsidian after migrating. Existing Git checkpoint refs retain their original namespace so earlier recovery points remain available.
 Version 1.2.0 includes the complete sync implementation; the former Mac-only
 `Sync Obsidian Vault.command` script is no longer required by the plugin.
 The plugin provides manual sync. An existing Mac watcher can continue running;
@@ -95,7 +95,7 @@ UI testing is performed locally on macOS.
 Publish the same clean source commit to private Forgejo and public GitHub, then
 deploy runtime artifacts into each local vault while preserving `data.json`.
 Tag releases with the manifest version (e.g. `1.2.0`) and attach `main.js`,
-`manifest.json`, `styles.css`, and `vault-git-sync.zip`. Never publish vault content, credentials,
+`manifest.json`, `styles.css`, and `git-sync-desktop.zip`. Never publish vault content, credentials,
 or machine-specific configuration.
 
 MIT licensed. This independently implemented plugin contains no VaultBridge
@@ -103,7 +103,7 @@ or GitSync.md application code.
 
 ## Manual Git tools (1.3.0)
 
-Open **Settings → Vault Git Sync → Manual Git actions**, or the command
+Open **Settings → Git Sync Desktop → Manual Git actions**, or the command
 **Open manual Git tools**. The ribbon still runs the familiar complete sync.
 Every action shows live progress, a result, and actionable failure details.
 Buttons are disabled while another operation is running.

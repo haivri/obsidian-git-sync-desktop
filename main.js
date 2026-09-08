@@ -33,7 +33,7 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
     if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force'].includes(action)) return false;
     if (action === 'force' && !['ours', 'theirs'].includes(options.preference)) return false;
     if (!this.supported()) {
-      new Notice('Vault Git Sync requires desktop Obsidian on macOS, Windows, or Linux.', 10000);
+      new Notice('Git Sync Desktop requires desktop Obsidian on macOS, Windows, or Linux.', 10000);
       return false;
     }
     if (this.syncing) {

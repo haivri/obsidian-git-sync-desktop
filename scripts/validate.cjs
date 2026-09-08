@@ -4,7 +4,7 @@ const vm = require('node:vm');
 const manifest = require('../manifest.json');
 const pkg = require('../package.json');
 assert.equal(manifest.version, pkg.version);
-assert.equal(manifest.id, 'vault-git-sync');
+assert.equal(manifest.id, 'git-sync-desktop');
 assert.equal(manifest.isDesktopOnly, true);
 new vm.Script(fs.readFileSync('main.js', 'utf8'));
 console.log(`Validated ready-to-install runtime ${manifest.version}; no compilation or dependencies required.`);

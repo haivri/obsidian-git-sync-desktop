@@ -1,4 +1,4 @@
-# Vault Git Sync Plugin Operating Contract
+# Git Sync Desktop Plugin Operating Contract
 
 - Keep the canonical source identical to both installed vault copies.
 - Preserve the left-ribbon sync command and visible failure reporting.
