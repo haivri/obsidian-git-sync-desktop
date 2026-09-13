@@ -32,6 +32,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
   class Setting {
     constructor(container) { this.settingEl = container; }
     setName() { return this; } setDesc() { return this; }
+    addText(fn) { fn({ setValue() { return this; }, onChange() { return this; } }); return this; }
     addButton(fn) {
       const button = { setButtonText(text) { this.text = text; return this; }, setCta() { return this; },
         onClick(callback) { this.callback = callback; return this; }, setDisabled(disabled) { this.disabled = disabled; return this; } };
@@ -44,8 +45,8 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
     setMessage(message) { notices.push(message); }
     hide() {}
   }
-  const context = { module: { exports: {} }, process: { platform,
-    env: { ...process.env, LOCALAPPDATA: home, XDG_STATE_HOME: home } },
+  const context = { module: { exports: {} }, URL, setTimeout, clearTimeout, process: { platform,
+    env: { ...process.env, LOCALAPPDATA: home, XDG_STATE_HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home || os.tmpdir(), 'empty.gitconfig') } },
     require(name) {
       if (name === 'obsidian') return { Plugin, Notice, Modal, PluginSettingTab, Setting, Platform: { isMobile: mobile } };
       if (name === 'node:os') return { homedir: () => home };
@@ -181,7 +182,7 @@ for (const platform of ['darwin', 'win32', 'linux']) {
     const execute = (file, args, options, callback) => {
       calls.push({ file, args, options });
       if (args[0] === 'add') return callback(Object.assign(new Error('stage failed'), { stderr: 'LFS upload filter failed' }));
-      const output = args[0] === 'rev-parse' ? dir : args[0] === 'branch' ? 'main' : '';
+      const output = args[0] === 'rev-parse' ? dir : args[0] === 'branch' ? 'main' : args.includes('remote.origin.url') ? 'https://example.invalid/vault.git' : '';
       callback(null, { stdout: output });
     };
     const { instance, notices } = load({ home: dir, vault: dir, platform, execute });
@@ -323,4 +324,159 @@ test('manual settings wire every action, show persistent feedback, and confirm f
   tabs[0].hide();
   assert.equal(instance.listeners.size, 0);
   assert.equal(modals.length, 1);
+});
+
+function freshVault(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-setup-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const vault = path.join(dir, 'vault'); fs.mkdirSync(vault);
+  const config = path.join(dir, 'empty.gitconfig'); fs.writeFileSync(config, '');
+  const git = (cwd, ...args) => cp.execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config } }).trim();
+  const remote = path.join(dir, 'remote.git'); git(dir, 'init', '--bare', '--initial-branch=main', remote);
+  // HTTPS-shaped input exercises validation without contacting a real host.
+  const url = 'https://setup.example.invalid/vault.git';
+  git(dir, 'config', '--file', config, `url.${remote}.insteadOf`, url);
+  fs.writeFileSync(path.join(vault, 'note.md'), 'Whole vault\n');
+  const loaded = load({ home: dir, vault });
+  const prepare = () => loaded.instance.runAction('prepare', { name: 'Setup Test', email: 'setup@example.invalid' });
+  const upload = () => loaded.instance.runAction('upload', { expectedRemote: url, expectedBranch: 'main' });
+  return { dir, vault, remote, url, git, ...loaded, prepare, upload };
+}
+
+test('fresh setup includes arbitrary files, hidden settings and case-insensitive LFS attachments; retries are stable', async t => {
+  const f = freshVault(t);
+  for (const name of ['image.PnG', 'photo.JPEG', 'document.pdf', 'custom.xyz', '.hidden', '.obsidian/plugins/demo/main.js', '.obsidian/plugins/demo/data.json', '.obsidian/themes/demo/theme.css', '.obsidian/workspace.json', '.trash/deleted.md', '.obsidian/cache/item']) {
+    const file = path.join(f.vault, name); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, `payload ${name}\n`);
+  }
+  fs.writeFileSync(path.join(f.vault, '.gitignore'), 'private.txt\n'); fs.writeFileSync(path.join(f.vault, 'private.txt'), 'ignored');
+  fs.writeFileSync(path.join(f.vault, '.gitattributes'), '*.md text\n');
+  assert.equal(await f.prepare(), true, f.instance.feedback);
+  const tracked = f.git(f.vault, 'ls-files');
+  for (const file of ['custom.xyz', '.hidden', '.obsidian/plugins/demo/data.json', '.obsidian/themes/demo/theme.css']) assert.ok(tracked.includes(file), file);
+  for (const file of ['private.txt', 'workspace.json', '.trash/', '.obsidian/cache/']) assert.ok(!tracked.includes(file), file);
+  for (const file of ['image.PnG', 'photo.JPEG', 'document.pdf']) assert.match(f.git(f.vault, 'show', `HEAD:${file}`), /^version https:\/\/git-lfs/);
+  assert.match(f.git(f.vault, 'show', 'HEAD:custom.xyz'), /payload/);
+  assert.match(fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8'), /^\*\.md text\n/);
+  const attributes = fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8');
+  assert.ok(attributes.includes('*.PnG filter=lfs'));
+  assert.ok(!attributes.includes('['), 'patterns remain compatible with VaultBridge wildcard matching');
+  const head = f.git(f.vault, 'rev-parse', 'HEAD');
+  assert.equal(await f.prepare(), true);
+  assert.equal(f.git(f.vault, 'rev-parse', 'HEAD'), head);
+  assert.equal(f.git(f.vault, 'status', '--porcelain'), '');
+  assert.equal(f.git(f.vault, 'config', '--local', 'filter.lfs.required'), 'true');
+});
+
+test('connect and first upload round-trip attachments and establish normal two-way sync', async t => {
+  const f = freshVault(t);
+  const payload = Buffer.alloc(8192, 41); fs.writeFileSync(path.join(f.vault, 'photo.png'), payload);
+  assert.equal(await f.prepare(), true, f.instance.feedback);
+  assert.equal(await f.instance.runAction('status'), true);
+  assert.match(f.instance.feedback, /computer only/);
+  assert.equal(await f.instance.runAction('connect', { url: f.url }), true, f.instance.feedback);
+  assert.equal(await f.instance.runAction('push'), true);
+  assert.match(f.instance.feedback, /remote is empty/);
+  assert.equal(await f.upload(), true, f.instance.feedback);
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), f.git(f.vault, 'rev-parse', 'HEAD'));
+  assert.equal(f.git(f.vault, 'config', 'branch.main.remote'), 'origin');
+  const peer = path.join(f.dir, 'peer'); f.git(f.dir, 'clone', f.remote, peer); f.git(peer, 'lfs', 'install', '--local'); f.git(peer, 'lfs', 'pull');
+  assert.ok(fs.readFileSync(path.join(peer, 'photo.png')).equals(payload), 'independent clone receives attachment bytes');
+  f.git(peer, 'config', 'user.name', 'Peer'); f.git(peer, 'config', 'user.email', 'peer@example.invalid');
+  fs.writeFileSync(path.join(peer, 'peer.md'), 'remote'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Peer'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, 'local.md'), 'local');
+  assert.equal(await f.instance.syncVault(), true, f.instance.feedback);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'peer.md'), 'utf8'), 'remote');
+});
+
+test('missing identity and missing LFS stop before repository creation', async t => {
+  const f = freshVault(t);
+  assert.equal(await f.instance.runAction('prepare'), false);
+  assert.match(f.instance.feedback, /name and email/);
+  assert.equal(fs.existsSync(path.join(f.vault, '.git')), false);
+  const execute = (file, args, opts, cb) => {
+    if (args[0] === 'lfs') return cb(new Error('missing LFS'));
+    cp.execFile(file, args, opts, (error, stdout, stderr) => { if (error) error.stderr = stderr; cb(error, { stdout }); });
+  };
+  const missing = load({ home: f.dir, vault: f.vault, execute });
+  assert.equal(await missing.instance.runAction('prepare', { name: 'Test', email: 'test@example.invalid' }), false);
+  assert.match(missing.instance.feedback, /Install Git LFS/);
+  assert.equal(fs.existsSync(path.join(f.vault, '.git')), false);
+});
+
+test('setup refuses parent repositories and broken metadata', async t => {
+  const f = freshVault(t); f.git(f.dir, 'init');
+  assert.equal(await f.prepare(), false); assert.match(f.instance.feedback, /parent repository/);
+  assert.equal(fs.existsSync(path.join(f.vault, '.git')), false);
+  fs.writeFileSync(path.join(f.vault, '.git'), 'broken metadata');
+  assert.equal(await f.prepare(), false);
+  assert.equal(fs.readFileSync(path.join(f.vault, '.git'), 'utf8'), 'broken metadata');
+});
+
+test('remote validation, explicit replacement and destination review prevent unintended uploads', async t => {
+  const f = freshVault(t); await f.prepare();
+  for (const url of ['https://user:secret@example.invalid/vault', 'https://example.invalid/vault?token=secret', '--upload-pack=bad', 'file:///tmp/remote', 'http://example.invalid/vault']) {
+    assert.equal(await f.instance.runAction('connect', { url }), false);
+    assert.ok(!f.instance.feedback.includes('secret'));
+  }
+  assert.equal(await f.instance.runAction('connect', { url: f.url }), true);
+  assert.equal(await f.instance.runAction('connect', { url: 'https://elsewhere.example.invalid/vault' }), false);
+  assert.match(f.instance.feedback, /Replace remote/);
+  assert.equal(await f.instance.runAction('upload', { expectedRemote: 'wrong', expectedBranch: 'main' }), false);
+  assert.equal(f.git(f.remote, 'for-each-ref'), '');
+});
+
+test('unrelated and newly populated remotes are preserved', async t => {
+  const f = freshVault(t); await f.prepare();
+  assert.equal(await f.instance.runAction('connect', { url: f.url }), true);
+  const peer = path.join(f.dir, 'peer'); f.git(f.dir, 'clone', f.remote, peer);
+  f.git(peer, 'config', 'user.name', 'Peer'); f.git(peer, 'config', 'user.email', 'peer@example.invalid');
+  fs.writeFileSync(path.join(peer, 'other.md'), 'unrelated'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Different history'); f.git(peer, 'push');
+  const server = f.git(f.remote, 'rev-parse', 'main');
+  assert.equal(await f.upload(), false); assert.match(f.instance.feedback, /contains history/);
+  assert.equal(await f.instance.runAction('connect', { url: f.url }), false); assert.match(f.instance.feedback, /unrelated history/);
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
+});
+
+test('setup retains custom hooks on failure and resumes after repair', async t => {
+  const f = freshVault(t);
+  f.git(f.vault, 'init', '--initial-branch=main'); f.git(f.vault, 'config', 'gitSyncDesktop.setupPending', 'true');
+  const hook = path.join(f.vault, '.git/hooks/pre-push'); fs.writeFileSync(hook, '#!/bin/sh\necho custom\n');
+  assert.equal(await f.prepare(), false); assert.match(fs.readFileSync(hook, 'utf8'), /custom/);
+  fs.renameSync(hook, hook + '.preserved');
+  assert.equal(await f.prepare(), true, f.instance.feedback);
+  assert.match(fs.readFileSync(hook + '.preserved', 'utf8'), /custom/);
+});
+
+test('setup modal registers, previews whole vault coverage and cleans listeners on close', async t => {
+  const f = freshVault(t); f.instance.onload();
+  f.commands.find(c => c.id === 'setup-vault-sync').callback();
+  const modal = f.modals[0]; clearTimeout(modal.timer); await modal.check();
+  assert.ok(f.buttons.some(b => b.text === 'Set up this vault'));
+  assert.ok(f.buttons.some(b => b.text === 'Review upload'));
+  const texts = el => el.textContent + el.children.map(texts).join(' ');
+  assert.match(texts(modal.contentEl), /every attachment type/);
+  modal.close(); assert.equal(f.instance.listeners.size, 0);
+});
+
+test('separate push destinations remain unchanged and block setup uploads', async t => {
+  const f = freshVault(t); await f.prepare();
+  await f.instance.runAction('connect', { url: f.url });
+  f.git(f.vault, 'config', 'remote.origin.pushurl', 'https://different.example.invalid/vault.git');
+  assert.equal(await f.upload(), false); assert.match(f.instance.feedback, /separate push destination/);
+  assert.equal(await f.instance.runAction('connect', { url: f.url, replace: true }), false);
+  assert.equal(f.git(f.vault, 'config', 'remote.origin.pushurl'), 'https://different.example.invalid/vault.git');
+  assert.equal(f.git(f.remote, 'for-each-ref'), '');
+});
+
+test('existing repositories preserve author identity, rules and history during preparation', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.vault, '.gitattributes'), '*.pdf -filter\n');
+  const head = f.git(f.vault, 'rev-parse', 'HEAD');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.runAction('prepare', { name: 'Different', email: 'different@example.invalid' }), true);
+  assert.equal(f.git(f.vault, 'config', 'user.name'), 'Test');
+  assert.equal(f.git(f.vault, 'rev-parse', 'HEAD'), head);
+  assert.equal(fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8'), '*.pdf -filter\n');
+  assert.equal(fs.existsSync(path.join(f.vault, '.gitignore')), false);
 });

@@ -34,22 +34,45 @@ Save, pull, merge, and push with plain-language explanations and persistent sync
 
 ## Install
 
-1. Install Git and Git LFS. On macOS, use `xcode-select --install` and Homebrew's
-   `brew install git-lfs`. On Windows, install Git for Windows and Git LFS; on
-   Linux, install `git` and `git-lfs` with your distribution's package manager.
-   Run `git lfs install`. Ensure Git and Git LFS are on your system PATH, then
-   restart Obsidian. Standard Homebrew paths are added automatically on macOS.
-2. Configure Git identity and remote authentication in a terminal. The plugin
-   uses Git's existing credentials; it does not store tokens.
-3. Open a vault that is the root of its own Git repository, with an `origin`
-   remote and a checked-out branch. The matching branch must exist on the server.
-   Confirm you can fetch and push from a terminal first.
-4. Download `main.js` and `manifest.json` from the
-   [latest release](https://github.com/haivri/obsidian-git-sync-desktop/releases/latest).
-   Also download `styles.css` and put all three files in `<vault>/.obsidian/plugins/git-sync-desktop/`. Alternatively, extract
-   `git-sync-desktop.zip` into `<vault>/.obsidian/plugins/`.
-5. Restart Obsidian, allow community plugins, and enable **Git Sync Desktop**.
-6. Click the Git merge ribbon icon. Progress and any failure appear in Obsidian.
+1. Install Git and Git LFS using [Git downloads](https://git-scm.com/downloads)
+   and [Git LFS](https://git-lfs.com/), then restart Obsidian.
+2. Install `main.js`, `manifest.json`, and `styles.css` from the
+   [latest release](https://github.com/haivri/obsidian-git-sync-desktop/releases/latest)
+   into `<vault>/.obsidian/plugins/git-sync-desktop/`, then enable the plugin.
+3. Open **Settings → Git Sync Desktop → Set up vault sync** or the command
+   **Set up vault sync**. The sync ribbon also opens setup for an uninitialized vault.
+4. **Prepare this vault:** review your author name/email, attachment extensions,
+   and exclusions, then click **Set up this vault**. This creates a local Git
+   repository on `main`, enables LFS locally, and saves the first checkpoint.
+5. **Connect your repository:** create an empty private repository on GitHub,
+   Forgejo, or another Git host. Do not initialize it with a README, license,
+   or `.gitignore`. Set up authentication in your Git client/system credential
+   manager, paste the HTTPS or SSH clone URL, and click **Connect and check**.
+6. **Upload and verify:** review the actual destination, branch, and included
+   files, then click **Upload vault**. After success, use the normal sync ribbon.
+
+Setup includes **all unignored vault files**, including PNGs, JPEGs, PDFs,
+arbitrary attachment formats, hidden files, Obsidian settings, themes, and
+plugins. LFS extensions choose storage format; they do not limit which files
+sync. Default exclusions cover trash, workspace layouts, caches, and OS metadata.
+Existing `.gitignore`, global Git ignore rules, and `.git/info/exclude` also
+apply; inspect the exclusion preview and included-file list before uploading.
+
+The editable LFS preset covers common images, audio, video, PDFs, and archives,
+including mixed-case extensions. Git LFS must already be installed; the setup
+button configures it for this repository without changing global Git settings.
+Author identity is saved only to the local repository. URLs must contain no
+passwords or tokens; authentication remains with your system Git credentials.
+A connection check verifies read access; the upload checks write access and LFS
+transfer. Your host must support Git LFS.
+
+Existing repositories keep their rules, hooks, branch, and history. Setup does
+not migrate old attachments into LFS or combine unrelated histories. It refuses
+to initialize a vault inside a parent repository. A failed preparation can be
+retried after resolving the reported issue. Local commits remain available if
+remote setup or upload fails. Changing an existing remote requires the explicit
+**Replace remote** action. Use **Sync now** for an existing related remote;
+**Upload vault** is for an empty remote.
 
 The plugin ID is now `git-sync-desktop` (previously `vault-git-sync`). Existing users should disable the old plugin, move its settings into the new plugin folder, enable Git Sync Desktop, and update any command hotkeys. Do not enable both copies. The repository includes `scripts/migrate-install.py` to preserve the old installation and migrate settings, enabled state, and hotkeys before installing the new runtime. Restart Obsidian after migrating. Existing Git checkpoint refs retain their original namespace so earlier recovery points remain available.
 Version 1.2.0 includes the complete sync implementation; the former Mac-only
