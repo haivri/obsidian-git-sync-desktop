@@ -357,7 +357,7 @@ test('fresh setup includes arbitrary files, hidden settings and case-insensitive
   for (const file of ['private.txt', 'workspace.json', '.trash/', '.obsidian/cache/']) assert.ok(!tracked.includes(file), file);
   for (const file of ['image.PnG', 'photo.JPEG', 'document.pdf']) assert.match(f.git(f.vault, 'show', `HEAD:${file}`), /^version https:\/\/git-lfs/);
   assert.match(f.git(f.vault, 'show', 'HEAD:custom.xyz'), /payload/);
-  assert.match(fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8'), /^\*\.md text\n/);
+  assert.match(fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8'), /^\*\.md text\r?\n/);
   const attributes = fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8');
   assert.ok(attributes.includes('*.PnG filter=lfs'));
   assert.ok(!attributes.includes('['), 'patterns remain compatible with VaultBridge wildcard matching');
