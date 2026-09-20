@@ -74,7 +74,7 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         failures = ok ? 0 : failures + 1;
         retryAt = Date.now() + (failures ? [60000, 300000, 900000][Math.min(failures - 1, 2)] : 0);
       }
-      if (this.statusItem) { this.statusItem.textContent = this.feedback; this.statusItem.setAttribute('aria-label', this.feedback + ' Open sync status'); }
+      if (this.statusItem) { this.statusItem.textContent = ({ complete: 'All saved', local: 'Saved here · waiting to upload', pending: 'Edits waiting to sync', attention: 'Review needed', syncing: 'Saving…', failed: 'Sync needs attention' })[this.outcome?.kind] || 'Checking save status'; this.statusItem.setAttribute('aria-label', this.feedback + ' Open sync status'); }
     };
     this.automationTimer = setInterval(() => void poll(), 5000); void poll();
   }
@@ -970,10 +970,10 @@ class SyncHomeModal extends Modal {
     const status = this.contentEl.createEl('p', { text: this.plugin.feedback, attr: { role: 'status', 'aria-live': 'polite' } });
     const update = () => { status.textContent = this.plugin.feedback; };
     this.plugin.listeners.add(update); this.cleanup = () => this.plugin.listeners.delete(update);
-    new Setting(this.contentEl).addButton(b => b.setButtonText(this.plugin.attention ? 'Review and continue' : 'Sync now').setCta().onClick(async () => { this.close(); await this.plugin.syncVault(); }));
+    new Setting(this.contentEl).addButton(b => b.setButtonText((this.plugin.attention || this.plugin.outcome?.kind === 'attention') ? 'Review and continue' : 'Sync now').setCta().onClick(async () => { this.close(); await this.plugin.syncVault(); }));
     new Setting(this.contentEl).addButton(b => b.setButtonText('Recover previous work').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, this.plugin).open(); }));
     const details = this.contentEl.createEl('details'); details.createEl('summary', { text: 'Git tools and details' });
-    this.toolsCleanup = renderTools(details, this.plugin);
+    this.toolsCleanup = renderTools(details.createDiv(), this.plugin);
   }
   onClose() { this.cleanup?.(); this.toolsCleanup?.(); }
 }

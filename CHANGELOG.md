@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1
+
+- Keep the Git tools disclosure labeled and make status-bar messages concise.
+- Show Review and continue when the background helper reports attention.
+
 ## 1.5.0
 
 - Guided conflict review with settings differences, guarded choices, and a clear finish action.
