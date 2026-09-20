@@ -45,7 +45,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
     setMessage(message) { notices.push(message); }
     hide() {}
   }
-  const context = { module: { exports: {} }, URL, setTimeout, clearTimeout, process: { platform,
+  const context = { module: { exports: {} }, URL, setTimeout, clearTimeout, process: { platform, pid: process.pid, kill: process.kill.bind(process),
     env: { ...process.env, LOCALAPPDATA: home, XDG_STATE_HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home || os.tmpdir(), 'empty.gitconfig') } },
     require(name) {
       if (name === 'obsidian') return { Plugin, Notice, Modal, PluginSettingTab, Setting, Platform: { isMobile: mobile } };
@@ -262,8 +262,9 @@ for (const preference of ['ours', 'theirs']) {
     assert.ok(fs.existsSync(path.join(f.vault, 'computer-only.md')));
     assert.equal(f.git(f.remote, 'rev-parse', 'main'), server);
     f.git(f.vault, 'merge-base', '--is-ancestor', server, 'HEAD');
-    const checkpoint = f.git(f.vault, 'for-each-ref', '--format=%(objectname)', 'refs/vault-git-sync/checkpoints');
-    assert.equal(f.git(f.vault, 'show', `${checkpoint}:note.md`), 'computer choice');
+    const checkpoints = f.git(f.vault, 'for-each-ref', '--format=%(objectname)', 'refs/vault-git-sync/checkpoints').split('\n');
+    assert.ok(checkpoints.some(checkpoint => f.git(f.vault, 'show', `${checkpoint}:note.md`) === 'computer choice'));
+    assert.ok(checkpoints.includes(server), 'incoming parent stays recoverable');
     assert.equal(await instance.runAction('force', { preference: 'invalid' }), false);
   });
 }
@@ -479,4 +480,108 @@ test('existing repositories preserve author identity, rules and history during p
   assert.equal(f.git(f.vault, 'rev-parse', 'HEAD'), head);
   assert.equal(fs.readFileSync(path.join(f.vault, '.gitattributes'), 'utf8'), '*.pdf -filter\n');
   assert.equal(fs.existsSync(path.join(f.vault, '.gitignore')), false);
+});
+
+test('guided settings choice preserves incoming notes through finish and a second sync', async t => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'server\n');
+  fs.writeFileSync(path.join(peer, 'today.md'), 'journal entry\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'phone\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.attention.kind, 'conflicts');
+  assert.equal(await instance.runAction('review'), true);
+  const entry = instance.review[0];
+  assert.equal(await instance.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice: 'server' }), true, instance.feedback);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'today.md'), 'utf8'), 'journal entry\n');
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(f.git(f.remote, 'show', 'main:today.md'), 'journal entry');
+  assert.equal(instance.outcome.kind, 'complete');
+});
+
+test('review refuses a stale choice when an editor changes a conflicting file', async t => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'server\n'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'phone\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  await instance.syncVault(); await instance.runAction('review'); const entry = instance.review[0];
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'new work while reviewing\n');
+  assert.equal(await instance.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice: 'server' }), false);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), 'new work while reviewing\n');
+});
+
+test('unexpected loss of a received note is blocked and restored', async t => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'today.md'), 'keep me\n'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(await instance.syncVault(), true, 'A no-op sync must retain incoming protection');
+  fs.unlinkSync(path.join(f.vault, 'today.md'));
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.attention.kind, 'deletions');
+  assert.equal(f.git(f.remote, 'show', 'main:today.md'), 'keep me');
+  assert.equal(await instance.runAction('recover'), true, instance.feedback);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'today.md'), 'utf8'), 'keep me\n');
+  fs.unlinkSync(path.join(f.vault, 'today.md'));
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(await instance.runAction('approve-deletions', { fingerprint: instance.attention.fingerprint }), true);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(await instance.syncVault(), true, 'An explicitly approved deletion must not ask again');
+});
+
+test('large deletion review authorizes only the reviewed changes', async t => {
+  const f = fixture(t);
+  for (let n = 0; n < 6; n++) fs.writeFileSync(path.join(f.vault, `note-${n}.md`), 'saved\n');
+  const { instance } = load({ home: f.dir, vault: f.vault }); await instance.syncVault();
+  for (let n = 0; n < 5; n++) fs.unlinkSync(path.join(f.vault, `note-${n}.md`));
+  assert.equal(await instance.syncVault(), false);
+  const review = instance.attention;
+  fs.unlinkSync(path.join(f.vault, 'note-5.md'));
+  assert.equal(await instance.runAction('approve-deletions', { fingerprint: review.fingerprint }), false);
+  await instance.syncVault();
+  assert.equal(await instance.runAction('approve-deletions', { fingerprint: instance.attention.fingerprint }), true);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+});
+
+test('command-line helper uses the same runtime without Obsidian', async t => {
+  const f = fixture(t); fs.writeFileSync(path.join(f.vault, 'helper.md'), 'background\n');
+  const result = cp.spawnSync(process.execPath, [path.join(__dirname, '..', 'main.js'), '--sync', f.vault], {
+    env: { ...process.env, HOME: f.dir, XDG_STATE_HOME: f.dir, LOCALAPPDATA: f.dir }, encoding: 'utf8'
+  });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(f.git(f.remote, 'show', 'main:helper.md'), 'background');
+  assert.equal(JSON.parse(result.stdout).kind, 'complete');
+});
+
+test('an abandoned owner lock is recovered but a live Git child is never displaced', async t => {
+  const f = fixture(t);
+  const state = process.platform === 'darwin' ? path.join(f.dir, 'Library', 'Application Support', 'ObsidianVaultSync') : path.join(f.dir, 'ObsidianVaultSync');
+  const lock = path.join(state, 'sync.lock'); fs.mkdirSync(lock, { recursive: true });
+  // A process that has exited gives a real, provably inactive PID.
+  const exited = cp.spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ pid: exited.pid, childPID: process.pid }));
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), false);
+  assert.ok(fs.existsSync(lock));
+  fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ pid: exited.pid }));
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('file history recovery restores selected bytes and protects current edits without uploading', async t => {
+  const f = fixture(t); const original = f.git(f.vault, 'rev-parse', 'HEAD');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'new work to protect\n');
+  assert.equal(await instance.runAction('history'), true);
+  assert.ok(instance.history.some(item => item.oid === original));
+  assert.equal(await instance.runAction('history-files', { oid: original }), true);
+  assert.ok(instance.historyFiles.some(item => item.path === 'note.md'));
+  assert.equal(await instance.runAction('restore-history', { oid: original, path: 'note.md' }), true, instance.feedback);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), 'original\n');
+  const copies = path.join(f.vault, '.git', 'vault-sync', 'copies');
+  assert.ok(fs.readdirSync(copies).some(folder => fs.readFileSync(path.join(copies, folder, 'content'), 'utf8') === 'new work to protect\n'));
+  assert.equal(f.git(f.remote, 'rev-parse', 'main'), original);
 });

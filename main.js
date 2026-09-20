@@ -1,4 +1,8 @@
-const { Notice, Plugin, Platform, Modal, PluginSettingTab, Setting } = require('obsidian');
+// One installable runtime serves Obsidian and the closed-app background helper.
+const HEADLESS = typeof require !== 'undefined' && require.main === module;
+const { Notice, Plugin, Platform, Modal, PluginSettingTab, Setting } = HEADLESS
+  ? { Notice: class { setMessage() {} hide() {} }, Plugin: class {}, Platform: { isMobile: false }, Modal: class {}, PluginSettingTab: class {}, Setting: class {} }
+  : require('obsidian');
 const COMMAND_NAME = 'Sync vault with Git';
 const LFS_EXTENSIONS = 'jpg jpeg png gif webp heic tif tiff mp3 m4a wav flac ogg mp4 mov mkv webm pdf zip 7z rar';
 const SETUP_IGNORES = ['.DS_Store', 'Thumbs.db', 'Desktop.ini', '.trash/', '.obsidian/workspace.json', '.obsidian/workspace-mobile.json', '.obsidian/workspaces.json', '.obsidian/cache/', '.obsidian/plugins/*/cache/', '.obsidian/plugins/*/.cache/'];
@@ -24,6 +28,8 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
     this.addCommand({ id: 'sync-vault-with-git', name: COMMAND_NAME,
       callback: () => this.syncVault() });
     this.addSettingTab(new SyncSettingsTab(this.app, this));
+    this.addCommand({ id: 'sync-status', name: 'Show save status', callback: () => new SyncHomeModal(this.app, this).open() });
+    if (this.app.workspace?.onLayoutReady) this.app.workspace.onLayoutReady(() => this.startAutomation());
     this.addCommand({ id: 'setup-vault-sync', name: 'Set up vault sync', callback: () => new SetupModal(this.app, this).open() });
     this.addCommand({ id: 'manual-git-tools', name: 'Open manual Git tools', callback: () => new SyncToolsModal(this.app, this).open() });
     for (const action of ACTIONS) this.addCommand({ id: `manual-${action.id}`, name: action.title, callback: () => this.runAction(action.id) });
@@ -33,7 +39,59 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
   async syncVault() { return this.runAction('sync'); }
 
   async runAction(action, options = {}) {
-    if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force', 'inspect', 'prepare', 'connect', 'upload'].includes(action)) return false;
+    const result = await SyncEngine.prototype.runAction.call(this, action, options);
+    if (this.app.workspace && this.attention?.kind === 'conflicts' && !options.automatic && !this.reviewOpen) new ConflictReviewModal(this.app, this).open();
+    if (this.app.workspace && this.attention?.kind === 'deletions' && !options.automatic && !this.reviewOpen) new DeletionReviewModal(this.app, this).open();
+    return result;
+  }
+  openSetup() { new SetupModal(this.app, this).open(); }
+  startAutomation() {
+    const fs = require('node:fs/promises'); const path = require('node:path'); const os = require('node:os');
+    const vault = this.app.vault.adapter.getBasePath();
+    const state = process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support', 'ObsidianVaultSync') : path.join(process.env.LOCALAPPDATA || process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'ObsidianVaultSync');
+    const file = path.join(state, require('node:crypto').createHash('sha256').update(vault).digest('hex') + '.json');
+    this.statusItem = this.addStatusBarItem?.();
+    this.statusItem?.addEventListener('click', () => new SyncHomeModal(this.app, this).open());
+    const changed = () => { this.lastEdit = Date.now(); if (this.outcome?.kind === 'complete') { this.outcome = { kind: 'pending' }; this.report('New edits are waiting to sync.'); } };
+    for (const event of ['modify', 'create', 'delete', 'rename']) this.registerEvent(this.app.vault.on(event, changed));
+    let lastRemote = 0; let retryAt = 0; let failures = 0; let seen = 0;
+    const poll = async () => {
+      if (this.syncing) return;
+      let helper = false;
+      try { const h = JSON.parse(await fs.readFile(file + '.helper', 'utf8')); helper = Date.now() - h.date < 20000; } catch { }
+      if (helper) {
+        try {
+          const record = JSON.parse(await fs.readFile(file, 'utf8'));
+          if (record.date > seen && (!this.lastEdit || this.lastEdit <= record.date)) {
+            seen = record.date; this.outcome = { kind: record.kind };
+            const label = { complete: 'All saved — you’re all set.', local: 'Saved here. Waiting to upload.', pending: 'New edits are waiting to sync.', attention: 'Some files need your review.', failed: 'Sync needs attention.' };
+            this.report(label[record.kind] || 'Checking your vault…');
+          }
+        } catch { }
+      } else if (!this.attention && Date.now() >= retryAt && ((this.lastEdit && Date.now() - this.lastEdit >= 45000) || (failures > 0 && Date.now() >= retryAt) || Date.now() - lastRemote >= 600000)) {
+        const started = Date.now(); const ok = await this.runAction('sync', { automatic: true }); lastRemote = Date.now();
+        if (ok && this.lastEdit <= started) this.lastEdit = 0;
+        failures = ok ? 0 : failures + 1;
+        retryAt = Date.now() + (failures ? [60000, 300000, 900000][Math.min(failures - 1, 2)] : 0);
+      }
+      if (this.statusItem) { this.statusItem.textContent = this.feedback; this.statusItem.setAttribute('aria-label', this.feedback + ' Open sync status'); }
+    };
+    this.automationTimer = setInterval(() => void poll(), 5000); void poll();
+  }
+  onunload() { clearInterval(this.automationTimer); }
+
+
+};
+
+class SyncEngine {
+  syncing = false;
+  listeners = new Set();
+  feedback = 'Checking vault…';
+  report(message) { this.feedback = message; for (const listener of this.listeners) listener(); }
+  supported() { return ['darwin', 'win32', 'linux'].includes(process.platform); }
+  openSetup() {}
+  async runAction(action, options = {}) {
+    if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force', 'inspect', 'prepare', 'connect', 'upload', 'review', 'resolve', 'recover', 'approve-deletions', 'history', 'history-files', 'restore-history'].includes(action)) return false;
     if (action === 'force' && !['ours', 'theirs'].includes(options.preference)) return false;
     if (!this.supported()) {
       new Notice('Git Sync Desktop requires desktop Obsidian on macOS, Windows, or Linux.', 10000);
@@ -43,15 +101,26 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
       new Notice('Vault sync is already running.');
       return false;
     }
+    const previousOutcome = this.outcome;
+    const previousFeedback = this.feedback;
     this.syncing = true;
+    this.attention = null;
+    this.outcome = { kind: 'syncing' };
     this.report('Checking vault…');
-    const progress = new Notice('Checking vault…', 0);
+    const progress = options.automatic ? { setMessage() {}, hide() {} } : new Notice('Checking vault…', 0);
     const { execFile } = require('node:child_process');
     const { promisify } = require('node:util');
     const fs = require('node:fs/promises');
     const path = require('node:path');
     const os = require('node:os');
-    const runFile = promisify(execFile);
+    const executeFile = promisify(execFile);
+    const runFile = async (...args) => {
+      const request = executeFile(...args);
+      request.catch(() => {}); // Observe immediately while persisting ownership.
+      if (ownsLock && request.child?.pid) await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, childPID: request.child.pid, started: Date.now() }));
+      try { return await request; }
+      finally { if (ownsLock && request.child?.pid) await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, started: Date.now() })); }
+    };
     // Keep the Mac path compatible with the existing watcher and shortcut.
     const state = process.platform === 'darwin'
       ? path.join(os.homedir(), 'Library', 'Application Support', 'ObsidianVaultSync')
@@ -60,9 +129,11 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         : (process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state')), 'ObsidianVaultSync');
     const lock = path.join(state, 'sync.lock');
     let ownsLock = false;
+    let publishState = async () => {};
+    let localSaved = false;
     let phase = 'Checking vault';
     const status = (message) => { phase = message; progress.setMessage(`${message}…`); this.report(`${message}…`); };
-    const done = (message) => { this.report(message); new Notice(message, 10000); return true; };
+    const done = (message) => { this.report(message); if (!options.automatic) new Notice(message, 10000); return true; };
     try {
       const vaultPath = this.app.vault.adapter.getBasePath?.();
       if (!vaultPath) throw new Error('This vault has no local filesystem path.');
@@ -72,14 +143,41 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
       }
       const executable = process.platform === 'darwin' ? '/usr/bin/git'
         : process.platform === 'win32' ? 'git.exe' : 'git';
+      const gitBytes = async (...args) => (await runFile(executable, args, { cwd: vaultPath, env, timeout: 600000, windowsHide: true, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })).stdout;
       const git = async (...args) => (await runFile(executable, args, {
         cwd: vaultPath, env, timeout: 600000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
       })).stdout.trim();
       await fs.mkdir(state, { recursive: true });
-      try { await fs.mkdir(lock); ownsLock = true; }
+      try {
+        await fs.mkdir(lock); ownsLock = true;
+        await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, started: Date.now() }));
+      }
       catch (error) {
-        if (error.code === 'EEXIST') throw new Error('Another vault sync is running. Try again after it finishes.');
-        throw error;
+        if (error.code === 'EEXIST') {
+          // Never break a legacy/unknown lock. A proven dead owner can be recovered.
+          let owner;
+          try { owner = JSON.parse(await fs.readFile(path.join(lock, 'owner.json'), 'utf8')); } catch { }
+          if (Number.isInteger(owner?.pid) && owner.pid > 0 && typeof process.kill === 'function') {
+            const dead = pid => {
+              if (!Number.isInteger(pid) || pid <= 0) return false;
+              try { process.kill(pid, 0); return false; } catch (check) { return check.code === 'ESRCH'; }
+            };
+            if (dead(owner.pid) && (!owner.childPID || dead(owner.childPID))) {
+              const gate = lock + '.reclaim'; let reclaim = false;
+              try {
+                await fs.mkdir(gate); reclaim = true;
+                const current = JSON.parse(await fs.readFile(path.join(lock, 'owner.json'), 'utf8'));
+                if (JSON.stringify(current) === JSON.stringify(owner) && dead(current.pid) && (!current.childPID || dead(current.childPID))) {
+                  await fs.rename(lock, `${lock}.abandoned-${Date.now()}`);
+                  await fs.mkdir(lock); ownsLock = true;
+                  await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, started: Date.now() }));
+                }
+              } catch (recoveryError) { if (recoveryError.code !== 'EEXIST' && recoveryError.code !== 'ENOENT') throw recoveryError; }
+              finally { if (reclaim) await fs.rmdir(gate); }
+            }
+          }
+          if (!ownsLock) throw new Error('Another vault sync is running. Try again after it finishes.');
+        } else throw error;
       }
       await git('--version');
       const optional = async (...args) => {
@@ -120,7 +218,7 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         return done(lfs ? 'Checks complete. Review the setup steps below.' : 'Git LFS is missing. Install it, restart Obsidian, then check again.');
       }
       if (!root && !['prepare'].includes(action)) {
-        if (action === 'sync') new SetupModal(this.app, this).open();
+        if (action === 'sync') this.openSetup();
         throw new Error('This vault is not set up yet. Open Set up vault sync to create its local repository.');
       }
       if (action === 'prepare') {
@@ -175,16 +273,92 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
       }
       if (await optional('config', '--local', '--get', 'gitSyncDesktop.setupPending') === 'true') throw new Error('Vault preparation is incomplete. Retry Set up this vault before syncing or uploading.');
       const gitDir = await git('rev-parse', '--absolute-git-dir');
+      const safety = new SyncSafety({ fs, path, git, gitBytes, vaultPath, gitDir });
+      await safety.load();
+      const statusFile = path.join(state, require('node:crypto').createHash('sha256').update(vaultPath).digest('hex') + '.json');
+      this.statusFile = statusFile;
+      publishState = async () => {
+        if (['history', 'history-files'].includes(action)) return;
+        // Persist only coarse state, never errors, paths or document contents.
+        const data = { kind: this.outcome?.kind || 'idle', localSaved, date: Date.now(), attention: this.attention?.kind || null, count: this.attention?.paths?.length || 0 };
+        await fs.writeFile(statusFile + '.tmp', JSON.stringify(data));
+        await fs.rename(statusFile + '.tmp', statusFile);
+      };
+      if (action === 'history') {
+        const rows = (await gitBytes('log', '--all', '-30', '--format=%H%x00%aI%x00%s%x00')).toString().split('\0');
+        this.history = [];
+        for (let i = 0; i + 2 < rows.length; i += 3) this.history.push({ oid: rows[i].trim(), date: rows[i + 1], subject: rows[i + 2] });
+        this.outcome = previousOutcome; this.report(previousFeedback); return true;
+      }
+      if (action === 'history-files') {
+        if (!/^[a-f0-9]{40}$/.test(options.oid || '')) throw new Error('Choose a saved checkpoint.');
+        const parents = (await git('rev-list', '--parents', '-n', '1', options.oid)).split(' ');
+        const args = parents.length > 1 ? [parents[1], options.oid] : ['--root', options.oid];
+        const rows = (await gitBytes('diff-tree', '--no-commit-id', '--name-status', '-z', '-r', ...args)).toString().split('\0');
+        this.historyFiles = [];
+        for (let i = 0; i + 1 < rows.length; i += 2) {
+          const type = rows[i]; let name = rows[i + 1];
+          if (/^[RC]/.test(type)) { name = rows[i + 2]; i++; }
+          this.historyFiles.push({ path: name, oid: type === 'D' ? parents[1] : options.oid, deleted: type === 'D' });
+        }
+        this.outcome = previousOutcome; this.report(previousFeedback); return true;
+      }
+      if (action === 'restore-history') {
+        await safety.restoreVersion(options.path, options.oid);
+        this.outcome = { kind: 'pending' };
+        return done('File restored on this computer. Sync when you’re ready to upload it.');
+      }
+      if (action === 'review') {
+        this.review = await safety.conflicts();
+        this.attention = this.review.length ? { kind: 'conflicts', paths: this.review.map(x => x.path) } : null;
+        this.outcome = { kind: this.review.length ? 'attention' : 'pending' };
+        return true;
+      }
+      if (action === 'resolve') {
+        await safety.resolve(options);
+        this.review = await safety.conflicts();
+        this.outcome = { kind: this.review.length ? 'attention' : 'pending' };
+        return done(this.review.length ? `${this.review.length} files still need your choice.` : 'Choices saved. Finish syncing to upload.');
+      }
+      if (action === 'recover') {
+        await safety.restoreIncoming();
+        this.outcome = { kind: 'pending' };
+        return done('Protected files restored. Sync now to verify.');
+      }
+      if (action === 'approve-deletions') {
+        await safety.approveLosses(options.fingerprint);
+        this.outcome = { kind: 'pending' };
+        return done('These exact changes are approved. Sync now to save them.');
+      }
       let pendingOperation = false;
       for (const marker of ['MERGE_HEAD', 'MERGE_AUTOSTASH', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer']) {
         try { await fs.access(path.join(gitDir, marker)); }
         catch (error) { if (error.code === 'ENOENT') continue; throw error; }
         pendingOperation = true;
-        if (action === 'status' || (action === 'finish' && marker === 'MERGE_HEAD')) continue;
+        if (marker === 'MERGE_HEAD' && ['sync', 'finish', 'status'].includes(action)) continue;
+        if (action === 'status') continue;
         throw new Error('Git has an unfinished operation. Resolve conflicts, then use Finish resolved merge. Other recovery operations must be completed in a Git client.');
       }
       const conflicts = await git('diff', '--name-only', '--diff-filter=U');
-      if (conflicts && action !== 'status') throw new Error('Some files still conflict. Resolve and stage them in a Git client, then use Finish resolved merge. Nothing was uploaded.');
+      if (conflicts && action !== 'status') {
+        const entries = await safety.conflicts();
+        this.attention = { kind: 'conflicts', paths: entries.map(x => x.path) };
+        this.outcome = { kind: 'attention' };
+        throw new Error(`${entries.length} files need your choice. Both versions are protected. Open Review conflicts to continue.`);
+      }
+      if (pendingOperation && action === 'sync') {
+        if (await git('diff', '--name-only')) throw new Error('Files changed during the combine. Review them before finishing; nothing was uploaded.');
+        await git('commit', '--no-edit');
+        await safety.finishIntegration();
+      }
+      if (!['status', 'push', 'pull', 'finish'].includes(action)) {
+        const losses = await safety.suspiciousLosses();
+        if (losses) {
+          this.attention = { kind: 'deletions', ...losses };
+          this.outcome = { kind: 'attention' };
+          throw new Error(`${losses.paths.length} unexpected file changes need your review. Previous versions are protected. Nothing was uploaded.`);
+        }
+      }
       const branch = await git('branch', '--show-current');
       if (!branch) throw new Error('Check out a branch before syncing; Git is in detached HEAD state.');
       const origin = await optional('config', '--get', 'remote.origin.url');
@@ -205,7 +379,7 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         return done(refs ? 'Repository reachable and connected. Use Sync now to combine and upload related history.' : 'Empty repository reachable and connected. Next: Upload vault. Write access and attachment transfer will be checked during upload.');
       }
       if (!origin && ['sync', 'status', 'push', 'pull', 'merge', 'upload'].includes(action)) {
-        if (action === 'sync') new SetupModal(this.app, this).open();
+        if (action === 'sync') this.openSetup();
         return done('This vault is on this computer only; no remote is connected. Use Commit locally to save edits, or Set up vault sync to connect a remote.');
       }
       const localOnly = action === 'commit' || action === 'finish';
@@ -252,7 +426,9 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         try { await fs.access(path.join(gitDir, 'MERGE_HEAD')); }
         catch { throw new Error('There is no merge to finish.'); }
         status('Finishing resolved merge');
+        if (await git('diff', '--name-only')) throw new Error('Review files changed during the combine before finishing.');
         await git('commit', '--no-edit');
+        await safety.finishIntegration();
         return done(`Merge saved locally · ${(await git('rev-parse', 'HEAD')).slice(0, 8)}. Nothing uploaded. Use Push when ready.`);
       }
       if (['pull', 'push'].includes(action)) {
@@ -262,7 +438,10 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
           const ahead = Number(await git('rev-list', '--count', `${remoteHead}..HEAD`));
           if (ahead) throw new Error('This computer has saved work the server does not have. Use Merge to combine both histories, or Push if only this computer changed.');
           status('Bringing newer server changes here');
+          await safety.beginIntegration(remoteHead);
           await git('merge', '--ff-only', '--no-autostash', remoteHead);
+          await git('lfs', 'pull', 'origin');
+          await safety.finishIntegration();
           return done(`Server changes received · ${(await git('rev-parse', 'HEAD')).slice(0, 8)}. Nothing uploaded.`);
         }
         const behind = Number(await git('rev-list', '--count', `HEAD..${remoteHead}`));
@@ -279,6 +458,8 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         if (await git('status', '--porcelain')) {
           throw new Error('The vault changed while saving. Your checkpoint is safe; run sync again.');
         }
+        localSaved = true;
+        this.outcome = { kind: 'local' };
         if (action === 'commit') return done(`Saved locally · ${(await git('rev-parse', 'HEAD')).slice(0, 8)}. Nothing uploaded.`);
       }
       if (mergeHead) {
@@ -288,18 +469,33 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         status('Combining computer and server changes');
         const args = ['merge', '--no-edit', '--no-autostash'];
         if (action === 'force') args.push(`-X${options.preference}`);
-        try { await git(...args, mergeHead); }
+        await safety.beginIntegration(mergeHead);
+        try { await git(...args, mergeHead); await git('lfs', 'pull', 'origin'); await safety.finishIntegration(); }
         catch (error) { throw new Error(`Merge stopped. Restore point ${checkpointHead.slice(0, 8)} protects your saved computer version. Nothing uploaded. ${String(error.stderr || error.message).trim()}`, { cause: error }); }
         return done(`Combined locally · ${(await git('rev-parse', 'HEAD')).slice(0, 8)}. Nothing uploaded. Restore point: ${checkpointHead.slice(0, 8)}. Use Push when ready.`);
       }
       if (action === 'sync') {
         status('Getting remote changes');
         if (!await git('ls-remote', '--refs', 'origin')) {
-          new SetupModal(this.app, this).open();
+          this.openSetup();
           return done('Saved locally. The remote is empty; review the first upload in Set up vault sync.');
         }
-        await git('pull', '--no-rebase', '--no-autostash', '--no-edit', 'origin', branch);
+        const incoming = await fetchRemote();
+        await safety.beginIntegration(incoming);
+        try { await git('merge', '--no-edit', '--no-autostash', incoming); }
+        catch (error) {
+          const entries = await safety.conflicts();
+          if (entries.length) {
+            this.attention = { kind: 'conflicts', paths: entries.map(x => x.path) };
+            this.outcome = { kind: 'attention' };
+            throw new Error(`${entries.length} files need your choice. Both versions are protected.`);
+          }
+          throw error;
+        }
+        await safety.finishIntegration();
       }
+      await git('lfs', 'pull', 'origin');
+      await git('lfs', 'fsck', '--objects', 'HEAD');
       status('Uploading changes');
       await git('push', 'origin', `HEAD:refs/heads/${branch}`);
       status('Verifying sync');
@@ -308,17 +504,20 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
       if (remote.split(/\s+/)[0] !== head) {
         throw new Error('The server changed again. Run sync again to receive the latest edits.');
       }
-      const changed = await git('status', '--porcelain');
-      done(changed ? 'Checkpoint uploaded; newer local edits need another sync.' : `${action === 'push' ? 'Saved changes uploaded' : 'Vault synced'} · ${head.slice(0, 8)}`);
+      const changed = await git('status', '--porcelain') || ((await git('rev-parse', 'HEAD')) !== head);
+      this.outcome = { kind: changed ? 'pending' : 'complete', verifiedSHA: changed ? null : head };
+      done(changed ? 'Saved work uploaded. New edits are still being saved.' : 'All saved — you’re all set. This computer and the server match.');
       return !changed;
     } catch (error) {
+      if (!this.attention) this.outcome = { kind: localSaved ? 'local' : 'failed' };
       const detail = redact(String(error.stderr || error.message || error)).trim();
       this.report(`${phase} stopped: ${detail.slice(-1800)}`);
-      new Notice(this.feedback, 20000);
+      if (!options.automatic) new Notice(this.feedback, 20000);
       return false;
     } finally {
+      await publishState().catch(() => {});
       if (ownsLock) {
-        try { await fs.rmdir(lock); }
+        try { await fs.unlink(path.join(lock, 'owner.json')).catch(() => {}); await fs.rmdir(lock); }
         catch { new Notice('Sync ended, but its lock could not be released. Check the desktop sync helper.', 10000); }
       }
       progress.hide();
@@ -326,7 +525,7 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
       this.report(this.feedback);
     }
   }
-};
+}
 
 const ACTIONS = [
   { id: 'status', title: 'Check what needs doing', button: 'Check status', description: 'Checks the server and tells you whether to save, pull, combine, or upload. Does not change your notes.' },
@@ -508,4 +707,349 @@ class ForceMergeModal extends Modal {
   }
   confirm(preference) { this.close(); void this.plugin.runAction('force', { preference }); }
   onClose() { this.contentEl.empty(); }
+}
+
+// Private recovery metadata lives inside .git and is never synced or logged.
+class SyncSafety {
+  constructor(context) { Object.assign(this, context); this.directory = this.path.join(this.gitDir, 'vault-sync'); }
+  async load() {
+    await this.fs.mkdir(this.directory, { recursive: true });
+    try { this.data = JSON.parse(await this.fs.readFile(this.path.join(this.directory, 'recovery.json'), 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; this.data = {}; }
+  }
+  async save() {
+    const file = this.path.join(this.directory, 'recovery.json');
+    await this.fs.writeFile(file + '.tmp', JSON.stringify(this.data));
+    await this.fs.rename(file + '.tmp', file);
+  }
+  async safePath(name) {
+    if (!name || this.path.isAbsolute(name) || name.split(/[\\/]/).some(x => x === '..' || x.toLowerCase() === '.git')) throw new Error('This file path is not safe to change.');
+    const absolute = this.path.resolve(this.vaultPath, name);
+    if (!absolute.startsWith(this.path.resolve(this.vaultPath) + this.path.sep)) throw new Error('This file is outside the vault.');
+    let cursor = this.vaultPath;
+    for (const component of this.path.relative(this.vaultPath, absolute).split(this.path.sep)) {
+      cursor = this.path.join(cursor, component);
+      try { if ((await this.fs.lstat(cursor)).isSymbolicLink()) throw new Error('Review symbolic links in a Git client.'); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    return absolute;
+  }
+  async optional(...args) { try { return await this.git(...args); } catch { return null; } }
+  async protect() {
+    const head = await this.git('rev-parse', 'HEAD');
+    await this.git('update-ref', `refs/vault-git-sync/checkpoints/${require('node:crypto').randomUUID()}`, head);
+    return head;
+  }
+  async beginIntegration(remote) {
+    if (this.data.pending) throw new Error('An interrupted combine needs review before another sync.');
+    const before = await this.protect();
+    await this.git('update-ref', `refs/vault-git-sync/checkpoints/${require('node:crypto').randomUUID()}-incoming`, remote);
+    this.data.pending = { before, remote }; await this.save();
+  }
+  async finishIntegration() {
+    if (!this.data.pending) return;
+    if ((await this.conflicts()).length) throw new Error('Choose versions before finishing the combine.');
+    // Do not stage materialization failures or concurrent writes as user edits.
+    if (await this.git('diff', '--name-only')) throw new Error('Files changed while combining versions. Review them before syncing.');
+    const after = await this.git('rev-parse', 'HEAD');
+    const before = this.data.pending.before;
+    const names = (await this.gitBytes('diff', '--name-only', '-z', before, after)).toString().split('\0').filter(Boolean);
+    if (names.length) this.data.incoming = [];
+    for (const name of names) {
+      const expected = await this.optional('rev-parse', `${after}:${name}`);
+      if (expected) this.data.incoming.push({ path: name, expected, previous: await this.optional('rev-parse', `${before}:${name}`) });
+    }
+    this.data.pending = null; this.data.approved = null; await this.save();
+  }
+  async suspiciousLosses() {
+    if (this.data.pending) {
+      if (await this.optional('rev-parse', '-q', '--verify', 'MERGE_HEAD')) return null;
+      const current = await this.git('rev-parse', 'HEAD');
+      if (current === this.data.pending.before && !await this.git('diff', '--cached', '--name-only')) {
+        this.data.pending = null; await this.save();
+      } else await this.finishIntegration();
+    }
+    const raw = (await this.gitBytes('status', '--porcelain=v1', '-z')).toString();
+    const entries = raw.split('\0'); const deleted = [];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]; if (!e) continue;
+      if (/[RC]/.test(e.slice(0, 2))) { i++; continue; }
+      if (e.slice(0, 2).includes('D')) deleted.push(e.slice(3));
+    }
+    const total = (await this.gitBytes('ls-files', '-z')).toString().split('\0').filter(Boolean).length;
+    const paths = new Set(deleted.length >= 20 || (deleted.length >= 5 && deleted.length / Math.max(total, 1) >= .2) ? deleted : []);
+    for (const entry of this.data.incoming || []) {
+      // An explicitly committed replacement/deletion supersedes this receipt.
+      if (await this.optional('rev-parse', `HEAD:${entry.path}`) !== entry.expected) continue;
+      const file = await this.safePath(entry.path);
+      try {
+        await this.fs.access(file);
+        const oid = await this.git('hash-object', '--path', entry.path, '--', file);
+        if (entry.previous && entry.previous !== entry.expected && oid === entry.previous) paths.add(entry.path);
+      } catch (error) { if (error.code === 'ENOENT') paths.add(entry.path); else throw error; }
+    }
+    if (!paths.size) return null;
+    const list = [...paths].sort();
+    const fingerprintHash = require('node:crypto').createHash('sha256').update(await this.git('rev-parse', 'HEAD')).update(raw).update(JSON.stringify(list));
+    for (const name of list) {
+      try { fingerprintHash.update(await this.fs.readFile(await this.safePath(name))); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; fingerprintHash.update('missing'); }
+    }
+    const fingerprint = fingerprintHash.digest('hex');
+    if (this.data.approved === fingerprint) return null;
+    return { paths: list, fingerprint };
+  }
+  async approveLosses(fingerprint) {
+    const losses = await this.suspiciousLosses();
+    if (!losses || losses.fingerprint !== fingerprint) throw new Error('The files changed. Review the latest changes first.');
+    await this.protect(); this.data.approved = fingerprint; await this.save();
+  }
+  async restoreVersion(name, commit) {
+    if (!/^[a-f0-9]{40}$/.test(commit || '')) throw new Error('Choose a saved checkpoint.');
+    if (this.data.pending || (await this.conflicts()).length) throw new Error('Finish reviewing the current combine before recovering another version.');
+    const file = await this.safePath(name);
+    const bytes = await this.gitBytes('show', `${commit}:${name}`);
+    await this.protect(); await this.backupFile(name);
+    await this.fs.mkdir(this.path.dirname(file), { recursive: true });
+    await this.fs.writeFile(file, bytes);
+    this.data.incoming = (this.data.incoming || []).filter(entry => entry.path !== name);
+    await this.save();
+  }
+  async backupFile(name) {
+    const file = await this.safePath(name);
+    let bytes;
+    try { bytes = await this.fs.readFile(file); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    const folder = this.path.join(this.directory, 'copies', require('node:crypto').randomUUID());
+    await this.fs.mkdir(folder, { recursive: true });
+    await this.fs.writeFile(this.path.join(folder, 'content'), bytes);
+    await this.fs.writeFile(this.path.join(folder, 'source.json'), JSON.stringify({ path: name, date: Date.now() }));
+  }
+  async restoreIncoming() {
+    const losses = await this.suspiciousLosses();
+    if (!losses) return;
+    await this.protect();
+    for (const name of losses.paths) {
+      const file = await this.safePath(name);
+      const entry = (this.data.incoming || []).find(x => x.path === name);
+      const blob = entry?.expected || await this.git('rev-parse', `HEAD:${name}`);
+      const bytes = await this.gitBytes('cat-file', 'blob', blob);
+      await this.backupFile(name);
+      await this.fs.mkdir(this.path.dirname(file), { recursive: true });
+      await this.fs.writeFile(file, bytes);
+      await this.git('add', '--', name);
+    }
+  }
+  async conflicts() {
+    const records = (await this.gitBytes('ls-files', '-u', '-z')).toString().split('\0').filter(Boolean);
+    const grouped = new Map();
+    for (const row of records) {
+      const match = /^(\d+) ([a-f0-9]+) ([123])\t([\s\S]+)$/.exec(row);
+      if (!match) throw new Error('Cannot read conflict details safely.');
+      const [, mode, oid, stage, name] = match;
+      if (!grouped.has(name)) grouped.set(name, { path: name, sides: {} });
+      grouped.get(name).sides[stage] = { oid, mode };
+    }
+    const result = [];
+    for (const entry of grouped.values()) {
+      for (const stage of ['1', '2', '3']) {
+        if (!entry.sides[stage]) continue;
+        const bytes = await this.gitBytes('cat-file', 'blob', entry.sides[stage].oid);
+        entry.sides[stage].binary = bytes.includes(0);
+        entry.sides[stage].text = bytes.includes(0) ? null : bytes.toString('utf8');
+      }
+      const file = await this.safePath(entry.path);
+      let working = null;
+      try { working = require('node:crypto').createHash('sha256').update(await this.fs.readFile(file)).digest('hex'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      entry.fingerprint = JSON.stringify({ sides: entry.sides, working });
+      result.push(entry);
+    }
+    return result;
+  }
+  async resolve({ path: name, choice, fingerprint, content }) {
+    const entry = (await this.conflicts()).find(x => x.path === name);
+    if (!entry || entry.fingerprint !== fingerprint) throw new Error('This conflict changed. Review the latest versions.');
+    if (!['phone', 'server', 'both', 'edited'].includes(choice)) throw new Error('Choose a version first.');
+    const file = await this.safePath(name);
+    if (Object.values(entry.sides).some(side => side.mode !== '100644' && side.mode !== '100755')) throw new Error('This file type needs review in a Git client.');
+    await this.protect(); await this.backupFile(name);
+    if (choice === 'both') {
+      if (name.startsWith('.obsidian/') || !entry.sides['2'] || !entry.sides['3']) throw new Error('Choose one active settings version. Both originals remain protected.');
+      const parsed = this.path.parse(name);
+      const copy = this.path.join(parsed.dir, `${parsed.name} (Server copy ${require('node:crypto').randomUUID().slice(0,8)})${parsed.ext}`);
+      const destination = await this.safePath(copy);
+      await this.fs.writeFile(destination, await this.gitBytes('cat-file', 'blob', entry.sides['3'].oid), { flag: 'wx' });
+      await this.git('add', '--', copy);
+    }
+    const selected = entry.sides[choice === 'server' ? '3' : '2'];
+    if (choice === 'edited' || selected) {
+      const bytes = choice === 'edited' ? require('node:buffer').Buffer.from(content, 'utf8') : await this.gitBytes('cat-file', 'blob', selected.oid);
+      if (name.endsWith('.json')) { try { JSON.parse(bytes.toString('utf8')); } catch { throw new Error('The chosen settings are not valid JSON. Correct them before saving.'); } }
+      await this.fs.mkdir(this.path.dirname(file), { recursive: true }); await this.fs.writeFile(file, bytes);
+      await this.git('add', '--', name);
+    } else {
+      await this.git('rm', '-f', '--', name);
+    }
+  }
+}
+
+class ConflictReviewModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() { this.plugin.reviewOpen = true; this.setTitle('Review your files'); void this.render(); }
+  onClose() { this.closed = true; this.plugin.reviewOpen = false; }
+  async render() {
+    await this.plugin.runAction('review');
+    if (this.closed) return;
+    const root = this.contentEl; root.empty();
+    const entries = this.plugin.review || [];
+    root.createEl('p', { text: 'Both originals are protected. Choose what you want to keep; nothing uploads until you finish.' });
+    if (!entries.length) {
+      root.createEl('p', { text: 'Your choices are saved. Finish syncing to make them available on your other devices.' });
+      new Setting(root).addButton(b => b.setButtonText('Save and finish syncing').setCta().onClick(async () => { this.close(); await this.plugin.syncVault(); }));
+      return;
+    }
+    root.createEl('p', { text: `${entries.length} files need your choice` });
+    for (const entry of entries) {
+      const card = root.createDiv({ cls: 'vault-git-sync-review' });
+      card.createEl('h3', { text: entry.path.startsWith('.obsidian/') ? 'Obsidian settings' : entry.path.split('/').pop() });
+      card.createEl('p', { text: entry.path });
+      if (entry.path.startsWith('.obsidian/')) card.createEl('p', { text: 'Choose the settings you want active. The server is not necessarily newer. Both originals remain available in protected history.' });
+      if (entry.path.startsWith('.obsidian/')) {
+        try {
+          const phone = JSON.parse(entry.sides['2']?.text), server = JSON.parse(entry.sides['3']?.text);
+          const keys = [...new Set([...Object.keys(phone), ...Object.keys(server)])].sort().filter(key => JSON.stringify(phone[key]) !== JSON.stringify(server[key]));
+          if (keys.length) {
+            card.createEl('h4', { text: 'Settings that differ' });
+            for (const key of keys) card.createEl('pre', { text: `${key}\nThis computer: ${JSON.stringify(phone[key]) ?? 'Not set'}\nServer: ${JSON.stringify(server[key]) ?? 'Not set'}` });
+          }
+        } catch { /* Full text previews below remain available. */ }
+      }
+      const pretty = side => {
+        if (!side) return 'Deleted on this side';
+        if (side.binary) return 'Attachment — choose a copy to keep.';
+        try { return JSON.stringify(JSON.parse(side.text), null, 2); } catch { return side.text; }
+      };
+      for (const [stage, title] of [['2', 'This computer'], ['3', 'Server']]) {
+        const section = card.createEl('details'); section.createEl('summary', { text: title });
+        section.createEl('pre', { text: pretty(entry.sides[stage]) });
+      }
+      const choose = async (choice, content) => {
+        const ok = await this.plugin.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice, content });
+        if (ok) await this.render(); else new Notice(this.plugin.feedback, 15000);
+      };
+      new Setting(card).addButton(b => b.setButtonText(entry.sides['2'] ? 'Use this computer’s version' : 'Keep this deletion').onClick(() => choose('phone')))
+        .addButton(b => b.setButtonText(entry.sides['3'] ? 'Use server version' : 'Use server deletion').onClick(() => choose('server')));
+      if (entry.sides['2'] && entry.sides['3'] && !entry.path.startsWith('.obsidian/')) new Setting(card).addButton(b => b.setButtonText('Keep both copies').onClick(() => choose('both')));
+      if (!entry.sides['2']?.binary && !entry.sides['3']?.binary) {
+        const editor = card.createEl('details'); editor.createEl('summary', { text: 'Combine edits' });
+        const input = editor.createEl('textarea', { cls: 'vault-git-sync-result' }); input.value = entry.sides['2']?.text || '';
+        new Setting(editor).setDesc('Review the full result before saving.').addButton(b => b.setButtonText('Save this result').onClick(() => choose('edited', input.value)));
+      }
+    }
+  }
+}
+
+class DeletionReviewModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; this.losses = plugin.attention; }
+  onOpen() {
+    this.plugin.reviewOpen = true; this.setTitle('Review unexpected changes');
+    this.contentEl.createEl('p', { text: 'These changes may remove recently received work or a large group of files. Previous versions are protected. Choose whether to restore them or apply these exact changes.' });
+    for (const name of this.losses?.paths || []) this.contentEl.createEl('p', { text: name });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Restore protected files').setCta().onClick(async () => { await this.plugin.runAction('recover'); this.close(); }))
+      .addButton(b => b.setButtonText('Apply these changes').onClick(async () => {
+        const ok = await this.plugin.runAction('approve-deletions', { fingerprint: this.losses.fingerprint });
+        this.close(); if (ok) await this.plugin.syncVault();
+      }));
+  }
+  onClose() { this.plugin.reviewOpen = false; }
+}
+
+class SyncHomeModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    this.setTitle('Your vault');
+    const status = this.contentEl.createEl('p', { text: this.plugin.feedback, attr: { role: 'status', 'aria-live': 'polite' } });
+    const update = () => { status.textContent = this.plugin.feedback; };
+    this.plugin.listeners.add(update); this.cleanup = () => this.plugin.listeners.delete(update);
+    new Setting(this.contentEl).addButton(b => b.setButtonText(this.plugin.attention ? 'Review and continue' : 'Sync now').setCta().onClick(async () => { this.close(); await this.plugin.syncVault(); }));
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Recover previous work').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, this.plugin).open(); }));
+    const details = this.contentEl.createEl('details'); details.createEl('summary', { text: 'Git tools and details' });
+    this.toolsCleanup = renderTools(details, this.plugin);
+  }
+  onClose() { this.cleanup?.(); this.toolsCleanup?.(); }
+}
+
+class HistoryRecoveryModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() { this.setTitle('Recover previous work'); void this.render(); }
+  onClose() { this.closed = true; }
+  async render(commit) {
+    const ok = await this.plugin.runAction(commit ? 'history-files' : 'history', commit ? { oid: commit.oid } : {});
+    if (this.closed) return;
+    this.contentEl.empty();
+    if (!ok) { this.contentEl.createEl('p', { text: this.plugin.feedback }); return; }
+    this.contentEl.createEl('p', { text: 'Choose a checkpoint and a file. Its current contents will be protected before restoring. Nothing uploads until you sync.' });
+    if (!commit) {
+      for (const entry of this.plugin.history || []) new Setting(this.contentEl).setName(new Date(entry.date).toLocaleString()).setDesc(entry.subject)
+        .addButton(b => b.setButtonText('View files').onClick(() => this.render(entry)));
+    } else {
+      new Setting(this.contentEl).addButton(b => b.setButtonText('Back to checkpoints').onClick(() => this.render()));
+      for (const file of this.plugin.historyFiles || []) new Setting(this.contentEl).setName(file.path).setDesc(file.deleted ? 'Restore the version before deletion.' : 'Restore the version saved in this checkpoint.')
+        .addButton(b => b.setButtonText('Restore file').onClick(async () => {
+          const restored = await this.plugin.runAction('restore-history', { path: file.path, oid: file.oid });
+          if (restored) { this.close(); new SyncHomeModal(this.app, this.plugin).open(); }
+        }));
+    }
+  }
+}
+
+module.exports.SyncEngine = SyncEngine;
+module.exports.SyncSafety = SyncSafety;
+
+if (HEADLESS) {
+  const fs = require('node:fs/promises');
+  const path = require('node:path');
+  const { execFile } = require('node:child_process');
+  const runFile = require('node:util').promisify(execFile);
+  const args = process.argv.slice(2);
+  const watch = args[0] === '--watch';
+  if (!['--sync', '--watch'].includes(args[0]) || !args[1]) {
+    process.stderr.write('Usage: node main.js --sync|--watch /path/to/vault\n'); process.exitCode = 2;
+  } else {
+    const engine = new SyncEngine();
+    const vault = path.resolve(args[1]);
+    engine.app = { vault: { adapter: { getBasePath: () => vault } } };
+    let stopped = false;
+    process.on('SIGTERM', () => { stopped = true; });
+    process.on('SIGINT', () => { stopped = true; });
+    const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+    (async () => {
+      let lastRun = 0; let lastKey = ''; let changedAt = 0; let retryAt = 0; let failures = 0;
+      do {
+        const now = Date.now();
+        const raw = (await runFile('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: vault, maxBuffer: 8 * 1024 * 1024 })).stdout;
+        // Use metadata to debounce without reading large attachment diffs every five seconds.
+        const diff = (await runFile('git', ['diff', '--raw', 'HEAD'], { cwd: vault, maxBuffer: 16 * 1024 * 1024 })).stdout;
+        const keyHash = require('node:crypto').createHash('sha256').update(raw).update(diff);
+        for (const record of raw.split('\0')) {
+          if (record.length < 4) continue;
+          try { const info = await fs.stat(path.join(vault, record.slice(3))); keyHash.update(String(info.mtimeMs) + ':' + info.size); } catch { }
+        }
+        const key = keyHash.digest('hex');
+        if (key !== lastKey) { lastKey = key; changedAt = now; }
+        if (engine.attention && key !== engine.attentionKey) { engine.attention = null; retryAt = 0; lastRun = 0; }
+        engine.attentionKey = key;
+        const ready = !lastRun || (!engine.attention && now >= retryAt && ((raw && now - changedAt >= 45000) || (failures > 0 && now >= retryAt) || now - lastRun >= 600000));
+        if (ready) {
+          const ok = await engine.runAction('sync', { automatic: true }); lastRun = Date.now();
+          failures = ok ? 0 : failures + 1;
+          retryAt = lastRun + (failures ? [60000, 300000, 900000][Math.min(failures - 1, 2)] : 0);
+          process.stdout.write(JSON.stringify({ kind: engine.outcome?.kind, date: lastRun }) + '\n');
+          if (!watch) process.exitCode = ok ? 0 : 1;
+        }
+        if (watch && engine.statusFile) await fs.writeFile(engine.statusFile + '.helper', JSON.stringify({ pid: process.pid, date: Date.now() }));
+        if (!watch || stopped) break;
+        await wait(5000);
+      } while (!stopped);
+    })().catch(() => { process.stderr.write('Background sync needs attention. Open Obsidian to review.\n'); process.exitCode = 1; });
+  }
 }

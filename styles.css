@@ -23,3 +23,8 @@
   .vault-git-sync-tools .setting-item-control { justify-content: stretch; }
   .vault-git-sync-tools button { width: 100%; }
 }
+
+.vault-git-sync-review { padding: 1rem; margin-block: 1rem; border: 1px solid var(--background-modifier-border); border-radius: 12px; }
+.vault-git-sync-review pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow-y: auto; }
+.vault-git-sync-result { width: 100%; min-height: 14rem; font-family: var(--font-monospace); }
+.vault-git-sync-review .setting-item { flex-wrap: wrap; gap: .75rem; }

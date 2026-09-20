@@ -77,8 +77,31 @@ remote setup or upload fails. Changing an existing remote requires the explicit
 The plugin ID is now `git-sync-desktop` (previously `vault-git-sync`). Existing users should disable the old plugin, move its settings into the new plugin folder, enable Git Sync Desktop, and update any command hotkeys. Do not enable both copies. The repository includes `scripts/migrate-install.py` to preserve the old installation and migrate settings, enabled state, and hotkeys before installing the new runtime. Restart Obsidian after migrating. Existing Git checkpoint refs retain their original namespace so earlier recovery points remain available.
 Version 1.2.0 includes the complete sync implementation; the former Mac-only
 `Sync Obsidian Vault.command` script is no longer required by the plugin.
-The plugin provides manual sync. An existing Mac watcher can continue running;
-the legacy watcher and shortcut share its lock.
+The plugin saves automatically after editing settles and checks the server periodically.
+For syncing while Obsidian is closed, use the same installed runtime:
+`node main.js --watch /path/to/vault` (or `--sync` for one run). Replace old
+independent sync scripts with this entry point; the helper and plugin share a
+lock and status, and the plugin defers to a running helper.
+
+## Everyday saving and recovery
+
+The status bar opens **Save status**. **All saved — you’re all set** means the
+working copy is clean, attachments passed verification, and the server has the
+same commit. Offline work stays saved locally and retries with backoff.
+Automatic successes are quiet; a review remains visible until you resolve it.
+
+**Review your files** lists the affected files directly. Compare computer and
+server previews, inspect differing Obsidian settings, choose a version, combine
+text, or keep both note copies. Settings keep one active configuration. Finish
+with **Save and finish syncing**. A choice is rejected if the file changed while
+you were reading it. Git tools remain available separately.
+
+Both integration parents are protected in local Git history. Incoming notes
+that suddenly disappear or revert, and large deletion batches (20 files, or
+5 files comprising at least 20% of tracked files), stop for exact approval or
+restoration. **Recover previous work** restores an individual historical file
+and protects its current bytes first; restoration does not upload by itself.
+These local restore points complement an independent backup.
 
 ## Sync behavior
 
@@ -88,7 +111,7 @@ the legacy watcher and shortcut share its lock.
 - Only one cooperating local sync runs at a time. Existing merge/rebase recovery
   states stop sync before staging. A forcibly stopped process can leave a lock;
   it is never removed automatically while another sync may still be running.
-- Normal sync and merge leave conflicts visible for manual resolution. The explicit
+- Normal sync and merge open a guided file review for conflicts. The explicit
   advanced force-merge action can prefer one side for conflicts. No force push, reset,
   or implicit autostash is performed.
 - Mobile is excluded by the manifest and runtime guard. iPhone sync is handled
