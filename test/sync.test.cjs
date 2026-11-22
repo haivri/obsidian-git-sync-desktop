@@ -33,6 +33,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
     constructor(container) { this.settingEl = container; }
     setName() { return this; } setDesc() { return this; }
     addText(fn) { fn({ setValue() { return this; }, onChange() { return this; } }); return this; }
+    addToggle(fn) { fn({ setValue() { return this; }, onChange() { return this; } }); return this; }
     addButton(fn) {
       const button = { setButtonText(text) { this.text = text; return this; }, setCta() { return this; },
         onClick(callback) { this.callback = callback; return this; }, setDisabled(disabled) { this.disabled = disabled; return this; } };
@@ -56,7 +57,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
   vm.runInNewContext(source, context);
   const instance = new context.module.exports();
   instance.app = { vault: { adapter: { getBasePath: () => vault } } };
-  return { instance, notices, commands, tabs, buttons, modals };
+  return { instance, notices, commands, tabs, buttons, modals, api: context.module.exports };
 }
 
 function fixture(t) {
@@ -584,4 +585,110 @@ test('file history recovery restores selected bytes and protects current edits w
   const copies = path.join(f.vault, '.git', 'vault-sync', 'copies');
   assert.ok(fs.readdirSync(copies).some(folder => fs.readFileSync(path.join(copies, folder, 'content'), 'utf8') === 'new work to protect\n'));
   assert.equal(f.git(f.remote, 'rev-parse', 'main'), original);
+});
+
+
+test('protection survives unrelated syncs, additive commits and restart; partial text loss needs exact approval', async t => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'original\nFinished practices at 12:00\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Practice time'); f.git(peer, 'push');
+  let { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  fs.writeFileSync(path.join(peer, 'unrelated.md'), 'another note\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Unrelated'); f.git(peer, 'push');
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  ({ instance } = load({ home: f.dir, vault: f.vault }));
+  fs.appendFileSync(path.join(f.vault, 'note.md'), 'New checkbox completed\n');
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'original\nNew checkbox completed\n');
+  assert.equal(await instance.syncVault(), false);
+  assert.ok(instance.attention.details[0].removed.includes('Finished practices at 12:00'));
+  assert.ok(f.git(f.remote, 'show', 'main:note.md').includes('12:00'));
+  const old = instance.attention.fingerprint;
+  fs.writeFileSync(path.join(f.vault, 'other.md'), 'staged change\n'); f.git(f.vault, 'add', 'other.md');
+  assert.equal(await instance.runAction('approve-deletions', { fingerprint: old }), false, 'Index changes invalidate approval');
+  await instance.syncVault();
+  assert.equal(await instance.runAction('approve-deletions', { fingerprint: instance.attention.fingerprint }), true);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(await instance.syncVault(), true, 'Approved loss is not requested again');
+  fs.unlinkSync(path.join(f.vault, 'unrelated.md'));
+  assert.equal(await instance.syncVault(), false, 'Other files remain protected');
+});
+
+test('staged text loss is detected even when the working file retains the timestamp', async t => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'original\nTimestamp 12:00\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Time'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault }); await instance.syncVault();
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'original\n'); f.git(f.vault, 'add', 'note.md');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'original\nTimestamp 12:00\n');
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.attention.kind, 'deletions');
+});
+
+test('selective recovery restores a timestamp while retaining newer checkboxes and rejects stale previews', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'header\nTime 12:00\ncontext\n- [ ] shower\n');
+  f.git(f.vault, 'add', '.'); f.git(f.vault, 'commit', '-m', 'Time recorded');
+  const oid = f.git(f.vault, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'header\ncontext\n- [x] shower\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.runAction('recovery-notes'), true);
+  assert.ok(instance.recoveryNotes.includes('note.md'));
+  assert.equal(await instance.runAction('note-history', { path: 'note.md' }), true);
+  assert.ok(instance.history.some(x => x.oid === oid));
+  assert.equal(await instance.runAction('recovery-preview', { path: 'note.md', oid }), true);
+  const preview = instance.recoveryPreview;
+  const selected = preview.blocks.filter(b => b.historical.includes('Time 12:00')).map(b => b.id);
+  fs.appendFileSync(path.join(f.vault, 'note.md'), 'new edit\n');
+  assert.equal(await instance.runAction('restore-selection', { path: 'note.md', oid, fingerprint: preview.fingerprint, selected }), false);
+  await instance.runAction('recovery-preview', { path: 'note.md', oid });
+  const fresh = instance.recoveryPreview;
+  assert.equal(await instance.runAction('restore-selection', { path: 'note.md', oid, fingerprint: fresh.fingerprint,
+    selected: fresh.blocks.filter(b => b.historical.includes('Time 12:00')).map(b => b.id) }), true, instance.feedback);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), 'header\nTime 12:00\ncontext\n- [x] shower\nnew edit\n');
+  assert.equal(f.git(f.remote, 'show', 'main:note.md'), 'original', 'Recovery never uploads');
+  assert.equal(await instance.runAction('commit'), true, instance.feedback);
+  await instance.runAction('note-history', { path: 'note.md' });
+  const copy = instance.history.find(x => x.oid.startsWith('copy:')); assert.ok(copy);
+  assert.equal(await instance.runAction('recovery-preview', { path: 'note.md', oid: copy.oid }), true);
+  assert.ok(instance.recoveryPreview.blocks.some(b => b.historical.includes('new edit')));
+});
+
+test('strict text protection handles repeated lines, Unicode, reordering, CRLF and final newlines', () => {
+  const { api } = load();
+  assert.equal(api.missingLines('a\na\n🧘\n', 'a\n🧘').length, 1);
+  assert.equal(api.missingLines('a\nb\n', 'b\r\na').length, 0);
+  for (const [current, old] of [['a\na\n🧘\nend', 'a\n🧘\ntime\na\nend\n'], ['', 'text'], ['text', '']]) {
+    const blocks = api.recoveryBlocks(current, old);
+    assert.equal(api.renderRecovery(blocks, new Set()), current);
+    assert.equal(api.renderRecovery(blocks, new Set(blocks.filter(b => !b.shared).map(b => b.id))), old);
+  }
+});
+
+test('verification timestamp survives offline saves without claiming a fresh check', async t => {
+  const f = fixture(t); let { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true);
+  const verifiedAt = instance.verifiedAt; assert.ok(verifiedAt);
+  ({ instance } = load({ home: f.dir, vault: f.vault }));
+  f.git(f.vault, 'remote', 'set-url', 'origin', path.join(f.dir, 'offline.git'));
+  fs.appendFileSync(path.join(f.vault, 'note.md'), 'offline edit\n');
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.verifiedAt, verifiedAt);
+  assert.ok(instance.savedAt >= verifiedAt);
+  assert.equal(instance.outcome.kind, 'local');
+});
+
+
+test('invalid protected Markdown requires review and renamed notes cannot silently drop protection', async t => {
+  const f = fixture(t); const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'received text\n'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Received'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault }); await instance.syncVault();
+  fs.writeFileSync(path.join(f.vault, 'note.md'), Buffer.from([0xff]));
+  assert.equal(await instance.syncVault(), false); assert.match(instance.attention.details[0].reason, /could not be assessed/);
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'received text\n');
+  f.git(f.vault, 'mv', 'note.md', 'renamed.md');
+  assert.equal(await instance.syncVault(), false);
+  assert.ok(instance.attention.paths.includes('note.md'));
+  assert.equal(fs.readFileSync(path.join(f.vault, 'renamed.md'), 'utf8'), 'received text\n');
 });

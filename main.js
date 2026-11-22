@@ -63,9 +63,10 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         try {
           const record = JSON.parse(await fs.readFile(file, 'utf8'));
           if (record.date > seen && (!this.lastEdit || this.lastEdit <= record.date)) {
-            seen = record.date; this.outcome = { kind: record.kind };
+            seen = record.date; this.savedAt = record.savedAt; this.verifiedAt = record.verifiedAt; this.verifiedSHA = record.verifiedSHA;
+            this.outcome = { kind: record.kind === 'complete' && !record.verifiedAt ? 'local' : record.kind };
             const label = { complete: 'All saved — you’re all set.', local: 'Saved here. Waiting to upload.', pending: 'New edits are waiting to sync.', attention: 'Some files need your review.', failed: 'Sync needs attention.' };
-            this.report(label[record.kind] || 'Checking your vault…');
+            this.report((label[this.outcome.kind] || 'Checking your vault…') + ' ' + savedTimes(this));
           }
         } catch { }
       } else if (!this.attention && Date.now() >= retryAt && ((this.lastEdit && Date.now() - this.lastEdit >= 45000) || (failures > 0 && Date.now() >= retryAt) || Date.now() - lastRemote >= 600000)) {
@@ -74,7 +75,7 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
         failures = ok ? 0 : failures + 1;
         retryAt = Date.now() + (failures ? [60000, 300000, 900000][Math.min(failures - 1, 2)] : 0);
       }
-      if (this.statusItem) { this.statusItem.textContent = ({ complete: 'All saved', local: 'Saved here · waiting to upload', pending: 'Edits waiting to sync', attention: 'Review needed', syncing: 'Saving…', failed: 'Sync needs attention' })[this.outcome?.kind] || 'Checking save status'; this.statusItem.setAttribute('aria-label', this.feedback + ' Open sync status'); }
+      if (this.statusItem) { this.statusItem.textContent = ({ complete: 'All saved', local: 'Saved here · waiting to upload', pending: 'Edits waiting to sync', attention: 'Review needed', syncing: 'Saving…', failed: 'Sync needs attention' })[this.outcome?.kind] || 'Checking save status'; this.statusItem.setAttribute('aria-label', this.feedback + ' ' + savedTimes(this) + ' Open sync status'); this.statusItem.setAttribute('title', savedTimes(this)); }
     };
     this.automationTimer = setInterval(() => void poll(), 5000); void poll();
   }
@@ -91,7 +92,7 @@ class SyncEngine {
   supported() { return ['darwin', 'win32', 'linux'].includes(process.platform); }
   openSetup() {}
   async runAction(action, options = {}) {
-    if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force', 'inspect', 'prepare', 'connect', 'upload', 'review', 'resolve', 'recover', 'approve-deletions', 'history', 'history-files', 'restore-history'].includes(action)) return false;
+    if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force', 'inspect', 'prepare', 'connect', 'upload', 'review', 'resolve', 'recover', 'approve-deletions', 'history', 'history-files', 'restore-history', 'recovery-notes', 'note-history', 'recovery-preview', 'restore-selection'].includes(action)) return false;
     if (action === 'force' && !['ours', 'theirs'].includes(options.preference)) return false;
     if (!this.supported()) {
       new Notice('Git Sync Desktop requires desktop Obsidian on macOS, Windows, or Linux.', 10000);
@@ -277,13 +278,49 @@ class SyncEngine {
       await safety.load();
       const statusFile = path.join(state, require('node:crypto').createHash('sha256').update(vaultPath).digest('hex') + '.json');
       this.statusFile = statusFile;
+      try {
+        const prior = JSON.parse(await fs.readFile(statusFile, 'utf8'));
+        this.savedAt = prior.savedAt || this.savedAt; this.verifiedAt = prior.verifiedAt || this.verifiedAt;
+        this.verifiedSHA = prior.verifiedSHA || this.verifiedSHA;
+      } catch { }
+      const startHead = await safety.optional('rev-parse', 'HEAD');
       publishState = async () => {
-        if (['history', 'history-files'].includes(action)) return;
+        if (['history', 'history-files', 'recovery-notes', 'note-history', 'recovery-preview'].includes(action)) return;
         // Persist only coarse state, never errors, paths or document contents.
-        const data = { kind: this.outcome?.kind || 'idle', localSaved, date: Date.now(), attention: this.attention?.kind || null, count: this.attention?.paths?.length || 0 };
+        const latestHead = await safety.optional('rev-parse', 'HEAD');
+        if (latestHead && latestHead !== startHead) this.savedAt = Date.now();
+        const data = { savedAt: this.savedAt || null, verifiedAt: this.verifiedAt || null, verifiedSHA: this.verifiedSHA || null, kind: this.outcome?.kind || 'idle', localSaved, date: Date.now(), attention: this.attention?.kind || null, count: this.attention?.paths?.length || 0 };
         await fs.writeFile(statusFile + '.tmp', JSON.stringify(data));
         await fs.rename(statusFile + '.tmp', statusFile);
       };
+      if (action === 'recovery-notes') {
+        const tracked = (await gitBytes('ls-files', '-z')).toString().split('\0');
+        const deleted = (await gitBytes('log', '--all', '--diff-filter=D', '--name-only', '--format=', '-z', '--', '*.md')).toString().split('\0').map(x => x.replace(/^\n+/, ''));
+        this.recoveryNotes = [...new Set([...tracked, ...deleted, ...(await safety.copies()).map(x => x.path)].filter(x => /\.md$/i.test(x)))].sort();
+        this.outcome = previousOutcome; this.report(previousFeedback); return true;
+      }
+      if (action === 'note-history') {
+        await safety.safePath(options.path);
+        const rows = (await gitBytes('log', '--all', '-50', `--skip=${Math.max(0, Number(options.skip) || 0)}`, '--format=%H%x00%aI%x00%s%x00', '--', options.path)).toString().split('\0');
+        this.history = [];
+        for (let i = 0; i + 2 < rows.length; i += 3) {
+          const oid = rows[i].trim();
+          const exists = await safety.optional('rev-parse', `${oid}:${options.path}`);
+          const source = exists ? oid : await safety.optional('rev-parse', `${oid}^`);
+          if (source && await safety.optional('rev-parse', `${source}:${options.path}`)) this.history.push({ oid: source, date: rows[i + 1], subject: rows[i + 2] });
+        }
+        if (!options.skip) this.history.unshift(...(await safety.copies()).filter(x => x.path === options.path));
+        this.historyHasMore = rows.length >= 150;
+        this.outcome = previousOutcome; this.report(previousFeedback); return true;
+      }
+      if (action === 'recovery-preview') {
+        this.recoveryPreview = await safety.preview(options.path, options.oid);
+        this.outcome = previousOutcome; this.report(previousFeedback); return true;
+      }
+      if (action === 'restore-selection') {
+        await safety.restoreSelection(options);
+        this.outcome = { kind: 'pending' }; return done('Selected changes restored locally. Sync when ready to upload.');
+      }
       if (action === 'history') {
         const rows = (await gitBytes('log', '--all', '-30', '--format=%H%x00%aI%x00%s%x00')).toString().split('\0');
         this.history = [];
@@ -321,7 +358,7 @@ class SyncEngine {
         return done(this.review.length ? `${this.review.length} files still need your choice.` : 'Choices saved. Finish syncing to upload.');
       }
       if (action === 'recover') {
-        await safety.restoreIncoming();
+        await safety.restoreIncoming(options.fingerprint);
         this.outcome = { kind: 'pending' };
         return done('Protected files restored. Sync now to verify.');
       }
@@ -452,12 +489,15 @@ class SyncEngine {
       if (action !== 'push') {
         status('Saving local changes');
         await git('add', '--all');
+        const stagedLosses = await safety.suspiciousLosses();
+        if (stagedLosses) { this.attention = { kind: 'deletions', ...stagedLosses }; this.outcome = { kind: 'attention' }; throw new Error('Files changed while saving. Review the latest changes.'); }
         if (await git('diff', '--cached', '--name-only')) {
           await git('commit', '-m', `vault sync: ${new Date().toISOString()}`);
         }
         if (await git('status', '--porcelain')) {
           throw new Error('The vault changed while saving. Your checkpoint is safe; run sync again.');
         }
+        await safety.settleApproval();
         localSaved = true;
         this.outcome = { kind: 'local' };
         if (action === 'commit') return done(`Saved locally · ${(await git('rev-parse', 'HEAD')).slice(0, 8)}. Nothing uploaded.`);
@@ -505,6 +545,7 @@ class SyncEngine {
         throw new Error('The server changed again. Run sync again to receive the latest edits.');
       }
       const changed = await git('status', '--porcelain') || ((await git('rev-parse', 'HEAD')) !== head);
+      if (!changed) { this.verifiedAt = Date.now(); this.verifiedSHA = head; }
       this.outcome = { kind: changed ? 'pending' : 'complete', verifiedSHA: changed ? null : head };
       done(changed ? 'Saved work uploaded. New edits are still being saved.' : 'All saved — you’re all set. This computer and the server match.');
       return !changed;
@@ -709,6 +750,46 @@ class ForceMergeModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
+// Recovery text is local UI data; it must never enter the coarse sync journal.
+function decodeNote(bytes) {
+  if (bytes.length > 4 * 1024 * 1024) throw new Error('This note is too large for an inline preview. Use whole-file recovery.');
+  const text = new (require('node:util').TextDecoder)('utf-8', { fatal: true }).decode(bytes);
+  if (text.includes('\0')) throw new Error('This file is not a text note.');
+  return text;
+}
+function noteLines(text) { return text.replace(/\r\n/g, '\n').split('\n'); }
+function missingLines(expected, current) {
+  const counts = new Map();
+  for (const line of noteLines(current)) counts.set(line, (counts.get(line) || 0) + 1);
+  return noteLines(expected).filter(line => {
+    if (counts.get(line)) { counts.set(line, counts.get(line) - 1); return false; }
+    return line.length > 0; // An absent final newline is not lost text.
+  });
+}
+function recoveryBlocks(current, historical) {
+  const a = noteLines(current), b = noteLines(historical);
+  if (a.length * b.length > 4000000) throw new Error('This comparison is too large for selective recovery. Use whole-file recovery.');
+  const table = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) table[i][j] = a[i] === b[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+  const blocks = []; let i = 0, j = 0;
+  const add = (shared, left, right) => {
+    let block = blocks[blocks.length - 1];
+    if (!block || block.shared !== shared) { block = { id: blocks.length, shared, current: [], historical: [] }; blocks.push(block); }
+    block.current.push(...left); block.historical.push(...right);
+  };
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) { add(true, [a[i++]], [b[j++]]); }
+    else if (i < a.length && (j === b.length || table[i + 1][j] >= table[i][j + 1])) add(false, [a[i++]], []);
+    else add(false, [], [b[j++]]);
+  }
+  return blocks;
+}
+function renderRecovery(blocks, selected) { return blocks.flatMap(b => selected.has(b.id) ? b.historical : b.current).join('\n'); }
+function savedTimes(plugin) {
+  const format = time => time ? new Date(time).toLocaleString(undefined, { timeZoneName: 'short' }) : 'not yet verified';
+  return `Saved locally at: ${format(plugin.savedAt)} · Server verified at: ${format(plugin.verifiedAt)}`;
+}
+
 // Private recovery metadata lives inside .git and is never synced or logged.
 class SyncSafety {
   constructor(context) { Object.assign(this, context); this.directory = this.path.join(this.gitDir, 'vault-sync'); }
@@ -753,8 +834,9 @@ class SyncSafety {
     if (await this.git('diff', '--name-only')) throw new Error('Files changed while combining versions. Review them before syncing.');
     const after = await this.git('rev-parse', 'HEAD');
     const before = this.data.pending.before;
+    await this.settleApproval();
     const names = (await this.gitBytes('diff', '--name-only', '-z', before, after)).toString().split('\0').filter(Boolean);
-    if (names.length) this.data.incoming = [];
+    this.data.incoming = (this.data.incoming || []).filter(entry => !names.includes(entry.path));
     for (const name of names) {
       const expected = await this.optional('rev-parse', `${after}:${name}`);
       if (expected) this.data.incoming.push({ path: name, expected, previous: await this.optional('rev-parse', `${before}:${name}`) });
@@ -769,6 +851,7 @@ class SyncSafety {
         this.data.pending = null; await this.save();
       } else await this.finishIntegration();
     }
+    await this.settleApproval();
     const raw = (await this.gitBytes('status', '--porcelain=v1', '-z')).toString();
     const entries = raw.split('\0'); const deleted = [];
     for (let i = 0; i < entries.length; i++) {
@@ -778,41 +861,155 @@ class SyncSafety {
     }
     const total = (await this.gitBytes('ls-files', '-z')).toString().split('\0').filter(Boolean).length;
     const paths = new Set(deleted.length >= 20 || (deleted.length >= 5 && deleted.length / Math.max(total, 1) >= .2) ? deleted : []);
+    const details = [];
     for (const entry of this.data.incoming || []) {
-      // An explicitly committed replacement/deletion supersedes this receipt.
-      if (await this.optional('rev-parse', `HEAD:${entry.path}`) !== entry.expected) continue;
       const file = await this.safePath(entry.path);
-      try {
-        await this.fs.access(file);
+      const indexOID = await this.optional('rev-parse', `:${entry.path}`);
+      let bytes;
+      try { bytes = await this.fs.readFile(file); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      let missing = !bytes || !indexOID;
+      let lost = [];
+      let reason = missing ? 'Protected file removed' : '';
+      if (bytes && indexOID === entry.expected && await this.git('hash-object', '--path', entry.path, '--', file) === entry.expected) continue;
+      if (/\.md$/i.test(entry.path)) {
+        const protectedBytes = await this.gitBytes('cat-file', 'blob', entry.expected);
+        try {
+          const expected = decodeNote(protectedBytes);
+          for (const candidate of [bytes, indexOID ? await this.gitBytes('cat-file', 'blob', indexOID) : null]) {
+            const loss = missingLines(expected, candidate ? decodeNote(candidate) : '');
+            const counts = new Map();
+            for (const line of lost) counts.set(line, (counts.get(line) || 0) + 1);
+            const seen = new Map();
+            for (const line of loss) { const n = (seen.get(line) || 0) + 1; seen.set(line, n); if (n > (counts.get(line) || 0)) lost.push(line); }
+          }
+          if (lost.length) reason = 'Protected text removed or replaced';
+        } catch { reason = 'Protected Markdown could not be assessed'; }
+      } else if (bytes && entry.previous && entry.previous !== entry.expected) {
         const oid = await this.git('hash-object', '--path', entry.path, '--', file);
-        if (entry.previous && entry.previous !== entry.expected && oid === entry.previous) paths.add(entry.path);
-      } catch (error) { if (error.code === 'ENOENT') paths.add(entry.path); else throw error; }
+        if (oid === entry.previous || indexOID === entry.previous) reason = 'Protected file reverted';
+      }
+      if (reason) { paths.add(entry.path); details.push({ path: entry.path, reason, removed: lost }); }
     }
     if (!paths.size) return null;
     const list = [...paths].sort();
-    const fingerprintHash = require('node:crypto').createHash('sha256').update(await this.git('rev-parse', 'HEAD')).update(raw).update(JSON.stringify(list));
+    const fingerprintHash = require('node:crypto').createHash('sha256').update(await this.git('rev-parse', 'HEAD')).update(raw).update(await this.gitBytes('ls-files', '--stage', '-z')).update(JSON.stringify(this.data.incoming || [])).update(JSON.stringify(list));
     for (const name of list) {
       try { fingerprintHash.update(await this.fs.readFile(await this.safePath(name))); }
       catch (error) { if (error.code !== 'ENOENT') throw error; fingerprintHash.update('missing'); }
     }
     const fingerprint = fingerprintHash.digest('hex');
     if (this.data.approved === fingerprint) return null;
-    return { paths: list, fingerprint };
+    const approval = this.data.approval;
+    if (approval && approval.head === await this.git('rev-parse', 'HEAD') && approval.protection === JSON.stringify(this.data.incoming || []) &&
+      JSON.stringify(approval.versions.map(v => v.path).sort()) === JSON.stringify(list)) {
+      let matches = true;
+      for (const version of approval.versions) {
+        let working = null;
+        const file = await this.safePath(version.path);
+        try { await this.fs.access(file); working = await this.git('hash-object', '--path', version.path, '--', file); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (working !== version.oid || await this.optional('rev-parse', `:${version.path}`) !== version.oid) matches = false;
+      }
+      if (matches) return null; // The authorized bytes were staged by this save.
+    }
+    return { paths: list, fingerprint, details };
   }
   async approveLosses(fingerprint) {
     const losses = await this.suspiciousLosses();
     if (!losses || losses.fingerprint !== fingerprint) throw new Error('The files changed. Review the latest changes first.');
-    await this.protect(); this.data.approved = fingerprint; await this.save();
+    await this.protect();
+    const versions = [];
+    for (const name of losses.paths) {
+      const file = await this.safePath(name);
+      let oid = null;
+      try { await this.fs.access(file); oid = await this.git('hash-object', '-w', '--path', name, '--', file); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      versions.push({ path: name, oid });
+    }
+    this.data.approval = { head: await this.git('rev-parse', 'HEAD'), versions, protection: JSON.stringify(this.data.incoming || []) };
+    this.data.approved = fingerprint; await this.save();
+  }
+  async settleApproval() {
+    const approval = this.data.approval;
+    if (!approval || await this.git('rev-parse', 'HEAD') === approval.head) return;
+    for (const version of approval.versions) {
+      if (await this.optional('rev-parse', `HEAD:${version.path}`) !== version.oid) return;
+    }
+    const paths = new Set(approval.versions.map(x => x.path));
+    this.data.incoming = (this.data.incoming || []).filter(x => !paths.has(x.path));
+    for (const version of approval.versions) if (version.oid) this.data.incoming.push({ path: version.path, expected: version.oid, previous: null });
+    this.data.approval = null; this.data.approved = null; await this.save();
+  }
+  async fingerprint(name) {
+    const file = await this.safePath(name);
+    const hash = require('node:crypto').createHash('sha256').update(await this.git('rev-parse', 'HEAD'))
+      .update(await this.gitBytes('ls-files', '--stage', '-z')).update(JSON.stringify(this.data.incoming || []));
+    try { hash.update(await this.fs.readFile(file)); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; hash.update('missing'); }
+    return hash.digest('hex');
+  }
+  async copies() {
+    const folder = this.path.join(this.directory, 'copies');
+    let names; try { names = await this.fs.readdir(folder); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    const records = [];
+    for (const name of names) {
+      if (!/^[a-f0-9-]{36}$/.test(name)) continue;
+      const dir = this.path.join(folder, name);
+      if ((await this.fs.lstat(dir)).isSymbolicLink()) continue;
+      const metadata = JSON.parse(await this.fs.readFile(this.path.join(dir, 'source.json'), 'utf8'));
+      records.push({ path: metadata.path, oid: `copy:${name}`, date: new Date(metadata.date).toISOString(), subject: 'Protected before restoration' });
+    }
+    return records.sort((a, b) => b.date.localeCompare(a.date));
+  }
+  async sourceBytes(name, source) {
+    if (/^[a-f0-9]{40}$/.test(source)) return this.gitBytes('show', `${source}:${name}`);
+    if (!/^copy:[a-f0-9-]{36}$/.test(source) || !(await this.copies()).some(x => x.oid === source && x.path === name)) throw new Error('Choose a saved version of this note.');
+    const file = this.path.join(this.directory, 'copies', source.slice(5), 'content');
+    if ((await this.fs.lstat(file)).isSymbolicLink()) throw new Error('Recovery copy uses a symbolic link.');
+    return this.fs.readFile(file);
+  }
+  async preview(name, commit) {
+    const file = await this.safePath(name);
+    const fingerprint = await this.fingerprint(name);
+    let current = '';
+    try { current = decodeNote(await this.fs.readFile(file)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const historical = decodeNote(await this.sourceBytes(name, commit));
+    const blocks = recoveryBlocks(current, historical);
+    if (await this.fingerprint(name) !== fingerprint) throw new Error('The note changed. Open its preview again.');
+    return { path: name, commit, fingerprint, blocks };
+  }
+  async restoreSelection(options) {
+    if (this.data.pending || (await this.conflicts()).length) throw new Error('Finish the current combine first.');
+    const preview = await this.preview(options.path, options.oid);
+    if (preview.fingerprint !== options.fingerprint) throw new Error('The note changed. Review its latest version first.');
+    const selected = new Set(options.selected || []);
+    if (!selected.size || [...selected].some(id => !preview.blocks.some(b => b.id === id && !b.shared))) throw new Error('Select changes to restore.');
+    const content = renderRecovery(preview.blocks, selected);
+    await this.protect(); await this.backupFile(options.path);
+    if (await this.fingerprint(options.path) !== options.fingerprint) throw new Error('The note changed. Review it again.');
+    const file = await this.safePath(options.path);
+    await this.fs.mkdir(this.path.dirname(file), { recursive: true });
+    await this.fs.writeFile(file, content);
+    await this.git('add', '--', options.path);
+    // An explicit restore authorizes exactly the previewed result, not later edits.
+    const oid = await this.git('hash-object', '-w', '--path', options.path, '--', file);
+    this.data.incoming = (this.data.incoming || []).filter(x => x.path !== options.path);
+    this.data.incoming.push({ path: options.path, expected: oid, previous: null });
+    this.data.approved = null; this.data.approval = null; await this.save();
   }
   async restoreVersion(name, commit) {
-    if (!/^[a-f0-9]{40}$/.test(commit || '')) throw new Error('Choose a saved checkpoint.');
     if (this.data.pending || (await this.conflicts()).length) throw new Error('Finish reviewing the current combine before recovering another version.');
     const file = await this.safePath(name);
-    const bytes = await this.gitBytes('show', `${commit}:${name}`);
+    const bytes = await this.sourceBytes(name, commit);
     await this.protect(); await this.backupFile(name);
     await this.fs.mkdir(this.path.dirname(file), { recursive: true });
     await this.fs.writeFile(file, bytes);
+    await this.git('add', '--', name);
+    const expected = await this.git('hash-object', '-w', '--path', name, '--', file);
     this.data.incoming = (this.data.incoming || []).filter(entry => entry.path !== name);
+    this.data.incoming.push({ path: name, expected, previous: null });
+    this.data.approved = null; this.data.approval = null;
     await this.save();
   }
   async backupFile(name) {
@@ -824,9 +1021,10 @@ class SyncSafety {
     await this.fs.writeFile(this.path.join(folder, 'content'), bytes);
     await this.fs.writeFile(this.path.join(folder, 'source.json'), JSON.stringify({ path: name, date: Date.now() }));
   }
-  async restoreIncoming() {
+  async restoreIncoming(fingerprint) {
     const losses = await this.suspiciousLosses();
     if (!losses) return;
+    if (fingerprint && losses.fingerprint !== fingerprint) throw new Error('The files changed. Review them again.');
     await this.protect();
     for (const name of losses.paths) {
       const file = await this.safePath(name);
@@ -953,8 +1151,17 @@ class DeletionReviewModal extends Modal {
   onOpen() {
     this.plugin.reviewOpen = true; this.setTitle('Review unexpected changes');
     this.contentEl.createEl('p', { text: 'These changes may remove recently received work or a large group of files. Previous versions are protected. Choose whether to restore them or apply these exact changes.' });
-    for (const name of this.losses?.paths || []) this.contentEl.createEl('p', { text: name });
-    new Setting(this.contentEl).addButton(b => b.setButtonText('Restore protected files').setCta().onClick(async () => { await this.plugin.runAction('recover'); this.close(); }))
+    for (const name of this.losses?.paths || []) {
+      this.contentEl.createEl('h3', { text: name });
+      const detail = this.losses.details?.find(x => x.path === name);
+      if (detail) {
+        this.contentEl.createEl('p', { text: detail.reason });
+        this.contentEl.createEl('pre', { text: detail.removed.join('\n') });
+      }
+      const entry = this.plugin;
+      if (/\.md$/i.test(name)) new Setting(this.contentEl).addButton(b => b.setButtonText('Choose text to restore').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, entry, name).open(); }));
+    }
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Restore protected files').setCta().onClick(async () => { const ok = await this.plugin.runAction('recover', { fingerprint: this.losses.fingerprint }); if (ok) this.close(); }))
       .addButton(b => b.setButtonText('Apply these changes').onClick(async () => {
         const ok = await this.plugin.runAction('approve-deletions', { fingerprint: this.losses.fingerprint });
         this.close(); if (ok) await this.plugin.syncVault();
@@ -968,7 +1175,8 @@ class SyncHomeModal extends Modal {
   onOpen() {
     this.setTitle('Your vault');
     const status = this.contentEl.createEl('p', { text: this.plugin.feedback, attr: { role: 'status', 'aria-live': 'polite' } });
-    const update = () => { status.textContent = this.plugin.feedback; };
+    const times = this.contentEl.createEl('p', { text: savedTimes(this.plugin) });
+    const update = () => { status.textContent = this.plugin.feedback; times.textContent = savedTimes(this.plugin); };
     this.plugin.listeners.add(update); this.cleanup = () => this.plugin.listeners.delete(update);
     new Setting(this.contentEl).addButton(b => b.setButtonText((this.plugin.attention || this.plugin.outcome?.kind === 'attention') ? 'Review and continue' : 'Sync now').setCta().onClick(async () => { this.close(); await this.plugin.syncVault(); }));
     new Setting(this.contentEl).addButton(b => b.setButtonText('Recover previous work').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, this.plugin).open(); }));
@@ -979,9 +1187,51 @@ class SyncHomeModal extends Modal {
 }
 
 class HistoryRecoveryModal extends Modal {
-  constructor(app, plugin) { super(app); this.plugin = plugin; }
-  onOpen() { this.setTitle('Recover previous work'); void this.render(); }
+  constructor(app, plugin, note) { super(app); this.plugin = plugin; this.note = note; }
+  onOpen() { this.setTitle('Recover previous work'); void (this.note ? this.noteHistory(this.note) : this.notes()); }
   onClose() { this.closed = true; }
+  async notes() {
+    if (!await this.plugin.runAction('recovery-notes') || this.closed) return;
+    this.contentEl.empty();
+    this.contentEl.createEl('p', { text: 'Find a note, compare its versions, and restore only the text you need. Obsidian File Recovery snapshots are available separately in Settings → File recovery.' });
+    const list = this.contentEl.createDiv();
+    const show = query => {
+      list.empty();
+      for (const name of this.plugin.recoveryNotes.filter(x => x.toLowerCase().includes(query.toLowerCase())).slice(0, 100)) new Setting(list).setName(name).addButton(b => b.setButtonText('Versions').onClick(() => this.noteHistory(name)));
+    };
+    new Setting(this.contentEl).setName('Search notes (including deleted notes)').addText(input => input.onChange(show));
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Browse checkpoints').onClick(() => this.render()));
+    show('');
+  }
+  async noteHistory(name, skip = 0) {
+    if (!await this.plugin.runAction('note-history', { path: name, skip }) || this.closed) return;
+    this.contentEl.empty(); this.contentEl.createEl('h3', { text: name });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Find another note').onClick(() => this.notes()));
+    for (const entry of this.plugin.history) new Setting(this.contentEl).setName(new Date(entry.date).toLocaleString()).setDesc(entry.subject)
+      .addButton(b => b.setButtonText('Compare').onClick(() => this.preview(name, entry.oid)))
+      .addButton(b => b.setButtonText('Whole-file recovery').onClick(() => this.wholeFile(name, entry.oid)));
+    if (this.plugin.historyHasMore) new Setting(this.contentEl).addButton(b => b.setButtonText('Earlier versions').onClick(() => this.noteHistory(name, skip + 50)));
+  }
+  wholeFile(name, oid) {
+    this.contentEl.empty();
+    this.contentEl.createEl('p', { text: 'Replace the entire note with this version? Newer text and checkboxes will be replaced. The current file is backed up first; nothing uploads.' });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Cancel').onClick(() => this.noteHistory(name)))
+      .addButton(b => b.setButtonText('Replace whole file').onClick(async () => { if (await this.plugin.runAction('restore-history', { path: name, oid })) this.close(); }));
+  }
+  async preview(name, oid) {
+    if (!await this.plugin.runAction('recovery-preview', { path: name, oid }) || this.closed) return;
+    const preview = this.plugin.recoveryPreview; const selected = new Set();
+    this.contentEl.empty(); this.contentEl.createEl('h3', { text: name });
+    this.contentEl.createEl('p', { text: 'Choose changes to restore. Unselected changes keep the current text.' });
+    const result = this.contentEl.createEl('pre', { text: renderRecovery(preview.blocks, selected) });
+    for (const block of preview.blocks.filter(b => !b.shared)) {
+      this.contentEl.createEl('pre', { text: 'Current:\n' + block.current.join('\n') + '\nHistorical:\n' + block.historical.join('\n') });
+      new Setting(this.contentEl).addToggle(t => t.setValue(false).onChange(value => { if (value) selected.add(block.id); else selected.delete(block.id); result.textContent = renderRecovery(preview.blocks, selected); }));
+    }
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Restore selected changes').onClick(async () => {
+      if (await this.plugin.runAction('restore-selection', { path: name, oid, fingerprint: preview.fingerprint, selected: [...selected] })) this.close();
+    })).addButton(b => b.setButtonText('Back').onClick(() => this.noteHistory(name)));
+  }
   async render(commit) {
     const ok = await this.plugin.runAction(commit ? 'history-files' : 'history', commit ? { oid: commit.oid } : {});
     if (this.closed) return;
@@ -1053,3 +1303,7 @@ if (HEADLESS) {
     })().catch(() => { process.stderr.write('Background sync needs attention. Open Obsidian to review.\n'); process.exitCode = 1; });
   }
 }
+
+module.exports.recoveryBlocks = recoveryBlocks;
+module.exports.renderRecovery = renderRecovery;
+module.exports.missingLines = missingLines;

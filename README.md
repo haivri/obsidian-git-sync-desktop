@@ -197,3 +197,28 @@ Robert Fleming directed and reviewed this work. Recent refinements, documentatio
 ## Feedback
 
 Bug reports are welcome in this repository’s issue tracker when available. Include your Obsidian and plugin versions, desktop or mobile, a short reproduction, and expected versus actual behavior. Use a small sample note without personal content. This is a spare-time project; fixes and replies have no guaranteed schedule. Contributions and forks are welcome; donations are optional.
+
+
+## Text protection and selective recovery (1.6.0)
+
+Incoming Markdown remains protected per note across unrelated syncs, no-op checks,
+restarts, and additive saves. Removing or replacing protected text pauses saving
+for review even when other edits accompany the removal. Intentional edits to a
+protected checkbox or sentence can therefore require approval. Review shows the
+missing text; applying a decision approves only the versions reviewed. Changing
+a note or its staged version invalidates stale choices. Line-ending conversion
+and reordering unchanged lines do not count as lost text.
+
+Open **Recover previous work**, search for a note (including deleted notes), and
+choose a version to compare. Select only the changes you want and inspect the
+result before restoring. Unselected text remains current. Whole-file recovery
+is labeled separately. Current bytes are protected first, and recovery does not
+upload. Protected copies from earlier restorations also appear in note history.
+Selective previews support UTF-8 notes up to 4 MiB and bounded line comparisons;
+larger or non-text files retain whole-file recovery. Obsidian's own File Recovery
+snapshots are separate and remain accessible in **Settings → File recovery**.
+
+Save status reports the actual local-save and server-verification dates and
+zones. Offline saving never advances the server-verification time, and a helper
+heartbeat does not count as a verification. Unknown legacy timestamps remain
+unknown until a real save or verification occurs.
