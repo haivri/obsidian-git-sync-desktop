@@ -145,9 +145,13 @@ class SyncEngine {
       const executable = process.platform === 'darwin' ? '/usr/bin/git'
         : process.platform === 'win32' ? 'git.exe' : 'git';
       const gitBytes = async (...args) => (await runFile(executable, args, { cwd: vaultPath, env, timeout: 600000, windowsHide: true, encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })).stdout;
-      const git = async (...args) => (await runFile(executable, args, {
-        cwd: vaultPath, env, timeout: 600000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
-      })).stdout.trim();
+      const git = async (...args) => {
+        const opts = { cwd: vaultPath, env, timeout: 600000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 };
+        const before = args[0] === 'merge' ? (await runFile(executable, ['rev-parse', 'HEAD'], opts)).stdout.trim() : null;
+        const result = (await runFile(executable, args, opts)).stdout.trim();
+        if (args[0] === 'commit' || (before && (await runFile(executable, ['rev-parse', 'HEAD'], opts)).stdout.trim() !== before)) this.savedAt = Date.now();
+        return result;
+      };
       await fs.mkdir(state, { recursive: true });
       try {
         await fs.mkdir(lock); ownsLock = true;
@@ -283,12 +287,9 @@ class SyncEngine {
         this.savedAt = prior.savedAt || this.savedAt; this.verifiedAt = prior.verifiedAt || this.verifiedAt;
         this.verifiedSHA = prior.verifiedSHA || this.verifiedSHA;
       } catch { }
-      const startHead = await safety.optional('rev-parse', 'HEAD');
       publishState = async () => {
         if (['history', 'history-files', 'recovery-notes', 'note-history', 'recovery-preview'].includes(action)) return;
         // Persist only coarse state, never errors, paths or document contents.
-        const latestHead = await safety.optional('rev-parse', 'HEAD');
-        if (latestHead && latestHead !== startHead) this.savedAt = Date.now();
         const data = { savedAt: this.savedAt || null, verifiedAt: this.verifiedAt || null, verifiedSHA: this.verifiedSHA || null, kind: this.outcome?.kind || 'idle', localSaved, date: Date.now(), attention: this.attention?.kind || null, count: this.attention?.paths?.length || 0 };
         await fs.writeFile(statusFile + '.tmp', JSON.stringify(data));
         await fs.rename(statusFile + '.tmp', statusFile);
@@ -1164,7 +1165,8 @@ class DeletionReviewModal extends Modal {
       const entry = this.plugin;
       if (/\.md$/i.test(name)) new Setting(this.contentEl).addButton(b => b.setButtonText('Choose text to restore').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, entry, name).open(); }));
     }
-    new Setting(this.contentEl).addButton(b => b.setButtonText('Restore protected files').setCta().onClick(async () => { const ok = await this.plugin.runAction('recover', { fingerprint: this.losses.fingerprint }); if (ok) this.close(); }))
+    this.contentEl.createEl('p', { text: 'Whole-file restoration replaces newer text and checkboxes. Current files are backed up first.' });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Restore whole files').onClick(async () => { const ok = await this.plugin.runAction('recover', { fingerprint: this.losses.fingerprint }); if (ok) this.close(); }))
       .addButton(b => b.setButtonText('Apply these changes').onClick(async () => {
         const ok = await this.plugin.runAction('approve-deletions', { fingerprint: this.losses.fingerprint });
         this.close(); if (ok) await this.plugin.syncVault();

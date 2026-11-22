@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.1
+
+- Record local-save time when a commit or integration completes, rather than after networking. No-op checks preserve the existing save time.
+
 ## 1.6.0
 
 - Retain protection per note through unrelated syncs, restarts, and additive saves.

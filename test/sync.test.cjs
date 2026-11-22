@@ -692,3 +692,22 @@ test('invalid protected Markdown requires review and renamed notes cannot silent
   assert.ok(instance.attention.paths.includes('note.md'));
   assert.equal(fs.readFileSync(path.join(f.vault, 'renamed.md'), 'utf8'), 'received text\n');
 });
+
+
+test('local save time precedes slow networking and no-op sync does not advance it', async t => {
+  const f = fixture(t); let networkStarted = 0;
+  const execute = (file, args, options, callback) => {
+    if (args[0] === 'ls-remote' && !networkStarted) networkStarted = Date.now();
+    return cp.execFile(file, args, options, (error, stdout, stderr) => {
+      const finish = () => callback(error, { stdout, stderr });
+      if (args[0] === 'ls-remote') setTimeout(finish, 30); else finish();
+    });
+  };
+  const { instance } = load({ home: f.dir, vault: f.vault, execute });
+  fs.appendFileSync(path.join(f.vault, 'note.md'), 'new local work\n');
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.ok(instance.savedAt <= networkStarted, 'Local save must be recorded before network work');
+  const savedAt = instance.savedAt;
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(instance.savedAt, savedAt);
+});
