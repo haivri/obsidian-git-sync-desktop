@@ -28,3 +28,14 @@
 .vault-git-sync-review pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow-y: auto; }
 .vault-git-sync-result { width: 100%; min-height: 14rem; font-family: var(--font-monospace); }
 .vault-git-sync-review .setting-item { flex-wrap: wrap; gap: .75rem; }
+
+/* Note previews remain readable without widening or exhausting the modal. */
+.vault-sync-recovery-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 24rem;
+  overflow: auto;
+  padding: 0.75rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 0.5rem;
+}

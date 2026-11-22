@@ -654,8 +654,8 @@ class SetupModal extends Modal {
     const preview = container.createEl('details');
     preview.createEl('summary', { text: 'Review exclusions and existing attachment rules' });
     preview.createEl('p', { text: 'Fresh vaults exclude the following disposable files. Existing .gitignore rules are preserved and may exclude additional content. Git also respects global ignore rules and .git/info/exclude.' });
-    preview.createEl('pre', { text: SETUP_IGNORES.join('\n') });
-    preview.createEl('pre', { text: `Existing .gitignore:\n${state?.ignores || '(none)'}\n\nExisting .gitattributes:\n${state?.attributes || '(none)'}\n\nCurrently ignored files (existing repository):\n${state?.excluded || '(none detected; check again after preparation)'}` });
+    preview.createEl('pre', { cls: 'vault-sync-recovery-text', text: SETUP_IGNORES.join('\n') });
+    preview.createEl('pre', { cls: 'vault-sync-recovery-text', text: `Existing .gitignore:\n${state?.ignores || '(none)'}\n\nExisting .gitattributes:\n${state?.attributes || '(none)'}\n\nCurrently ignored files (existing repository):\n${state?.excluded || '(none detected; check again after preparation)'}` });
     button('Save on this computer', 'Creates a repository and first checkpoint with the reviewed rules. Nothing uploads.', 'Set up this vault', async () => {
       await this.act('prepare', this.fields);
     });
@@ -673,7 +673,7 @@ class SetupModal extends Modal {
       if (!this.closed) this.render();
     });
     if (this.reviewed) {
-      container.createEl('pre', { text: this.reviewed.text });
+      container.createEl('pre', { cls: 'vault-sync-recovery-text', text: this.reviewed.text });
       button('Start first upload', 'Uploads to the reviewed destination. If it has changed, review it again.', 'Upload vault', () => this.act('upload', { expectedRemote: this.reviewed.remote, expectedBranch: this.reviewed.branch }));
     }
     button('Continue normal syncing', 'Saves, combines related history, and uploads.', 'Sync now', () => this.plugin.syncVault());
@@ -957,7 +957,10 @@ class SyncSafety {
       if (!/^[a-f0-9-]{36}$/.test(name)) continue;
       const dir = this.path.join(folder, name);
       if ((await this.fs.lstat(dir)).isSymbolicLink()) continue;
-      const metadata = JSON.parse(await this.fs.readFile(this.path.join(dir, 'source.json'), 'utf8'));
+      let metadata;
+      try { metadata = JSON.parse(await this.fs.readFile(this.path.join(dir, 'source.json'), 'utf8')); await this.fs.access(this.path.join(dir, 'content')); }
+      catch { continue; } // An interrupted backup must not hide intact versions.
+      if (typeof metadata.path !== 'string' || !Number.isFinite(metadata.date)) continue;
       records.push({ path: metadata.path, oid: `copy:${name}`, date: new Date(metadata.date).toISOString(), subject: 'Protected before restoration' });
     }
     return records.sort((a, b) => b.date.localeCompare(a.date));
@@ -1117,7 +1120,7 @@ class ConflictReviewModal extends Modal {
           const keys = [...new Set([...Object.keys(phone), ...Object.keys(server)])].sort().filter(key => JSON.stringify(phone[key]) !== JSON.stringify(server[key]));
           if (keys.length) {
             card.createEl('h4', { text: 'Settings that differ' });
-            for (const key of keys) card.createEl('pre', { text: `${key}\nThis computer: ${JSON.stringify(phone[key]) ?? 'Not set'}\nServer: ${JSON.stringify(server[key]) ?? 'Not set'}` });
+            for (const key of keys) card.createEl('pre', { cls: 'vault-sync-recovery-text', text: `${key}\nThis computer: ${JSON.stringify(phone[key]) ?? 'Not set'}\nServer: ${JSON.stringify(server[key]) ?? 'Not set'}` });
           }
         } catch { /* Full text previews below remain available. */ }
       }
@@ -1128,7 +1131,7 @@ class ConflictReviewModal extends Modal {
       };
       for (const [stage, title] of [['2', 'This computer'], ['3', 'Server']]) {
         const section = card.createEl('details'); section.createEl('summary', { text: title });
-        section.createEl('pre', { text: pretty(entry.sides[stage]) });
+        section.createEl('pre', { cls: 'vault-sync-recovery-text', text: pretty(entry.sides[stage]) });
       }
       const choose = async (choice, content) => {
         const ok = await this.plugin.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice, content });
@@ -1156,7 +1159,7 @@ class DeletionReviewModal extends Modal {
       const detail = this.losses.details?.find(x => x.path === name);
       if (detail) {
         this.contentEl.createEl('p', { text: detail.reason });
-        this.contentEl.createEl('pre', { text: detail.removed.join('\n') });
+        this.contentEl.createEl('pre', { cls: 'vault-sync-recovery-text', text: detail.removed.join('\n') });
       }
       const entry = this.plugin;
       if (/\.md$/i.test(name)) new Setting(this.contentEl).addButton(b => b.setButtonText('Choose text to restore').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, entry, name).open(); }));
@@ -1190,21 +1193,26 @@ class HistoryRecoveryModal extends Modal {
   constructor(app, plugin, note) { super(app); this.plugin = plugin; this.note = note; }
   onOpen() { this.setTitle('Recover previous work'); void (this.note ? this.noteHistory(this.note) : this.notes()); }
   onClose() { this.closed = true; }
+  failure(retry) {
+    this.contentEl.empty(); this.contentEl.createEl('p', { text: this.plugin.feedback });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('Try again').onClick(retry));
+  }
   async notes() {
-    if (!await this.plugin.runAction('recovery-notes') || this.closed) return;
+    if (!await this.plugin.runAction('recovery-notes') || this.closed) { if (!this.closed) this.failure(() => this.notes()); return; }
     this.contentEl.empty();
     this.contentEl.createEl('p', { text: 'Find a note, compare its versions, and restore only the text you need. Obsidian File Recovery snapshots are available separately in Settings → File recovery.' });
-    const list = this.contentEl.createDiv();
+    let list;
     const show = query => {
       list.empty();
       for (const name of this.plugin.recoveryNotes.filter(x => x.toLowerCase().includes(query.toLowerCase())).slice(0, 100)) new Setting(list).setName(name).addButton(b => b.setButtonText('Versions').onClick(() => this.noteHistory(name)));
     };
     new Setting(this.contentEl).setName('Search notes (including deleted notes)').addText(input => input.onChange(show));
     new Setting(this.contentEl).addButton(b => b.setButtonText('Browse checkpoints').onClick(() => this.render()));
+    list = this.contentEl.createDiv();
     show('');
   }
   async noteHistory(name, skip = 0) {
-    if (!await this.plugin.runAction('note-history', { path: name, skip }) || this.closed) return;
+    if (!await this.plugin.runAction('note-history', { path: name, skip }) || this.closed) { if (!this.closed) this.failure(() => this.noteHistory(name, skip)); return; }
     this.contentEl.empty(); this.contentEl.createEl('h3', { text: name });
     new Setting(this.contentEl).addButton(b => b.setButtonText('Find another note').onClick(() => this.notes()));
     for (const entry of this.plugin.history) new Setting(this.contentEl).setName(new Date(entry.date).toLocaleString()).setDesc(entry.subject)
@@ -1219,13 +1227,13 @@ class HistoryRecoveryModal extends Modal {
       .addButton(b => b.setButtonText('Replace whole file').onClick(async () => { if (await this.plugin.runAction('restore-history', { path: name, oid })) this.close(); }));
   }
   async preview(name, oid) {
-    if (!await this.plugin.runAction('recovery-preview', { path: name, oid }) || this.closed) return;
+    if (!await this.plugin.runAction('recovery-preview', { path: name, oid }) || this.closed) { if (!this.closed) this.failure(() => this.noteHistory(name)); return; }
     const preview = this.plugin.recoveryPreview; const selected = new Set();
     this.contentEl.empty(); this.contentEl.createEl('h3', { text: name });
     this.contentEl.createEl('p', { text: 'Choose changes to restore. Unselected changes keep the current text.' });
-    const result = this.contentEl.createEl('pre', { text: renderRecovery(preview.blocks, selected) });
+    const result = this.contentEl.createEl('pre', { cls: 'vault-sync-recovery-text', text: renderRecovery(preview.blocks, selected) });
     for (const block of preview.blocks.filter(b => !b.shared)) {
-      this.contentEl.createEl('pre', { text: 'Current:\n' + block.current.join('\n') + '\nHistorical:\n' + block.historical.join('\n') });
+      this.contentEl.createEl('pre', { cls: 'vault-sync-recovery-text', text: 'Current:\n' + block.current.join('\n') + '\nHistorical:\n' + block.historical.join('\n') });
       new Setting(this.contentEl).addToggle(t => t.setValue(false).onChange(value => { if (value) selected.add(block.id); else selected.delete(block.id); result.textContent = renderRecovery(preview.blocks, selected); }));
     }
     new Setting(this.contentEl).addButton(b => b.setButtonText('Restore selected changes').onClick(async () => {
