@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.0
+
+- Treat checking and unchecking an unambiguous Markdown task as state changes, while continuing to protect removed task text, journal entries, duplicate tasks, and fenced examples.
+- Combine Markdown conflicts using the common ancestor and both versions, preserving independent edits and merging task state with wording changes when correspondence is clear.
+- Show a combined draft with per-section conflict choices and a final editable preview; unresolved or stale choices cannot be saved.
+- Give manual Merge the same guided conflict reporting as automatic desktop and helper sync.
+- Preview newer text and checkbox states before whole-file restoration, require confirmation, and reject stale restoration requests, including checkpoint-browser recovery.
+
 ## 1.6.1
 
 - Record local-save time when a commit or integration completes, rather than after networking. No-op checks preserve the existing save time.

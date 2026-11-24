@@ -90,9 +90,11 @@ working copy is clean, attachments passed verification, and the server has the
 same commit. Offline work stays saved locally and retries with backoff.
 Automatic successes are quiet; a review remains visible until you resolve it.
 
-**Review your files** lists the affected files directly. Compare computer and
-server previews, inspect differing Obsidian settings, choose a version, combine
-text, or keep both note copies. Settings keep one active configuration. Finish
+**Review your files** lists the affected files directly. Compare the common
+ancestor, computer, and server previews, inspect differing Obsidian settings,
+choose a version, combine text, or keep both note copies. Markdown drafts retain
+independent edits and provide choices for each conflicting section. Resolve all
+sections, review the full editable result, then save. Settings keep one active configuration. Finish
 with **Save and finish syncing**. A choice is rejected if the file changed while
 you were reading it. Git tools remain available separately.
 
@@ -111,7 +113,11 @@ These local restore points complement an independent backup.
 - Only one cooperating local sync runs at a time. Existing merge/rebase recovery
   states stop sync before staging. A forcibly stopped process can leave a lock;
   it is never removed automatically while another sync may still be running.
-- Normal sync and merge open a guided file review for conflicts. The explicit
+- Normal sync and merge automatically combine safe Markdown changes, including
+  task state and wording edits that can be matched unambiguously. Checking and
+  deliberate unchecking follow edit history; completed does not always win.
+  Incompatible edits, ambiguous repeated tasks, and deletion versus modification
+  remain available for guided review. The explicit
   advanced force-merge action can prefer one side for conflicts. No force push, reset,
   or implicit autostash is performed.
 - Mobile is excluded by the manifest and runtime guard. iPhone sync is handled
@@ -204,7 +210,10 @@ Bug reports are welcome in this repository’s issue tracker when available. Inc
 Incoming Markdown remains protected per note across unrelated syncs, no-op checks,
 restarts, and additive saves. Removing or replacing protected text pauses saving
 for review even when other edits accompany the removal. Intentional edits to a
-protected checkbox or sentence can therefore require approval. Review shows the
+protected sentence can therefore require approval. Checking or unchecking a
+uniquely identifiable task is a state change and does not count as removed text.
+Ambiguous duplicates retain strict protection; fenced examples are literal text.
+Review shows the
 missing text; applying a decision approves only the versions reviewed. Changing
 a note or its staged version invalidates stale choices. Line-ending conversion
 and reordering unchanged lines do not count as lost text.
@@ -212,7 +221,9 @@ and reordering unchanged lines do not count as lost text.
 Open **Recover previous work**, search for a note (including deleted notes), and
 choose a version to compare. Select only the changes you want and inspect the
 result before restoring. Unselected text remains current. Whole-file recovery
-is labeled separately. Current bytes are protected first, and recovery does not
+shows the newer text and checkbox states it would replace and requires explicit
+confirmation. This also applies when browsing checkpoints. Changed files invalidate
+the preview. Current bytes are protected first, and recovery does not
 upload. Protected copies from earlier restorations also appear in note history.
 Selective previews support UTF-8 notes up to 4 MiB and bounded line comparisons;
 larger or non-text files retain whole-file recovery. Obsidian's own File Recovery

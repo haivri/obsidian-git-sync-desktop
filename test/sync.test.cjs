@@ -8,6 +8,208 @@ const vm = require('node:vm');
 const cp = require('node:child_process');
 const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
+test('task protection permits state edits but retains text, duplicates and fenced examples', () => {
+  const { api } = load();
+  const original = '# Core\n- [ ] 🧘 practice\n\t- [x] child\n1. [ ] numbered\n';
+  const edited = '# Core\n- [x] 🧘 practice\n\t- [ ] child\n1. [-] numbered\n';
+  assert.equal(api.missingLines(original, edited).length, 0);
+  assert.equal(api.missingLines(edited, original).length, 0);
+  assert.equal(api.missingLines(original, edited.replace('practice', 'something else')).length, 1);
+  assert.equal(api.missingLines('- [ ] same\n- [ ] same', '- [x] same').length, 2);
+  for (const fence of ['```', '~~~~']) {
+    assert.equal(api.missingLines(`${fence}\n- [ ] example\n${fence}`, `${fence}\n- [x] example\n${fence}`).length, 1);
+  }
+});
+
+test('merge UI displays safe combined edits and enables saving only after conflict choices', async () => {
+  const { api, ui, buttons } = load();
+  const base = 'top\ncontext\nold\ncontext two\nend\n';
+  const local = 'LOCAL\ncontext\nleft\ncontext two\nend\n';
+  const server = 'top\ncontext\nright\ncontext two\nSERVER\n';
+  const entry = { path: 'demo.md', fingerprint: 'reviewed', sides: { '1': { text: base }, '2': { text: local }, '3': { text: server } }, merge: api.mergeNote(base, local, server) };
+  let resolved;
+  const plugin = { review: [entry], async runAction(action, options) { if (action === 'resolve') { resolved = options; this.review = []; } return true; } };
+  const modal = new ui.ConflictReviewModal({}, plugin); await modal.render();
+  const flatten = el => [el, ...el.children.flatMap(flatten)];
+  const input = flatten(modal.contentEl).find(el => el.tag === 'textarea');
+  const save = buttons.find(b => b.text === 'Save merged result');
+  assert.equal(save.disabled, true); assert.equal(input.disabled, true);
+  assert.ok(input.value.includes('LOCAL')); assert.ok(input.value.includes('SERVER'));
+  await buttons.find(b => b.text === 'Keep server section').callback();
+  assert.equal(save.disabled, false); assert.equal(input.disabled, false);
+  assert.equal(input.value, 'LOCAL\ncontext\nright\ncontext two\nSERVER\n');
+  await save.callback();
+  assert.equal(resolved.choice, 'merged'); assert.equal(resolved.content, input.value);
+});
+
+test('replacement UI shows what will be lost and does not restore before confirmation', async () => {
+  const { api, ui, buttons } = load(); let restored = false;
+  const plugin = { replacementPreview: { files: [{ path: 'demo.md', blocks: api.recoveryBlocks('- [x] task\nNew journal\n', '- [ ] task\n') }] },
+    async runAction(action, options) { if (action === 'recover') { restored = true; assert.equal(options.confirmReplacement, true); } return true; } };
+  const modal = new ui.IncomingReplacementModal({}, plugin, 'reviewed'); await modal.render();
+  const flatten = el => [el.textContent, ...el.children.flatMap(flatten)].join('\n');
+  assert.ok(flatten(modal.contentEl).includes('New journal'));
+  assert.ok(flatten(modal.contentEl).includes('- [x] task'));
+  assert.equal(restored, false);
+  await buttons.find(b => b.text === 'Replace whole files').callback();
+  assert.equal(restored, true);
+});
+
+test('three-way task merge preserves history, independent edits and task wording', () => {
+  const { api } = load();
+  const cases = [
+    ['- [ ] task\n', '- [x] task\n', '- [ ] task\n', '- [x] task\n'],
+    ['- [x] task\n', '- [ ] task\n', '- [x] task\n', '- [ ] task\n'],
+    ['- [ ] task\n', '- [x] task\n', '- [ ] task today\n', '- [x] task today\n'],
+    ['- [x] task\n', '- [ ] task\n', '- [x] task today\n', '- [ ] task today\n'],
+    ['- [ ] a\n- [ ] b\n', '- [x] a\n- [ ] b\n', '- [ ] a\n- [x] b\n', '- [x] a\n- [x] b\n'],
+    ['a\nb\nc\n', 'A\nb\nc\n', 'a\nb\nC\n', 'A\nb\nC\n'],
+    ['a\nb\n', 'insert\na\nb\n', 'a\nb\nappend\n', 'insert\na\nb\nappend\n'],
+    ['# 🧘\r\n- [ ] task\r\n', '# 🧘\r\n- [x] task\r\n', '# 🧘\r\n- [ ] task today\r\n', '# 🧘\n- [x] task today\n'],
+  ];
+  for (const [base, local, server, expected] of cases) {
+    const merge = api.mergeNote(base, local, server);
+    assert.equal(merge.clean, true, JSON.stringify({ base, local, server }));
+    assert.equal(api.renderMerge(merge), expected);
+    assert.equal(api.renderMerge(api.mergeNote(base, server, local)), expected);
+  }
+});
+
+test('three-way ambiguous edits require choices and retain safe portions in the result', () => {
+  const { api } = load();
+  for (const [base, local, server] of [
+    ['- [ ] task\n', '- [x] task\n', '- [-] task\n'],
+    ['- [ ] task\n', '', '- [x] task\n'],
+    ['- [ ] same\n- [ ] same\n', '- [x] same\n- [ ] same\n', '- [ ] renamed\n- [ ] same\n'],
+    ['```\n- [ ] example\n```\n', '```\n- [x] example\n```\n', '```\n- [ ] renamed\n```\n'],
+  ]) {
+    const merge = api.mergeNote(base, local, server);
+    assert.equal(merge.clean, false);
+    assert.throws(() => api.renderMerge(merge), /every conflicting section/);
+  }
+  const merge = api.mergeNote('top\ncommon\nold\ncontext\nend\n', 'LOCAL\ncommon\nleft\ncontext\nend\n', 'top\ncommon\nright\ncontext\nSERVER\n');
+  const choices = Object.fromEntries(merge.blocks.filter(b => b.conflict).map(b => [b.id, 'server']));
+  assert.equal(api.renderMerge(merge, choices), 'LOCAL\ncommon\nright\ncontext\nSERVER\n');
+});
+
+test('Monday regression: five completions and appended journal entries sync without loss review', async t => {
+  const f = fixture(t), peer = makePeer(f);
+  const before = '# Core\n' + ['weight', 'practice one', 'practice two', 'reminder', 'shower'].map(x => `- [ ] ${x}\n`).join('');
+  fs.writeFileSync(path.join(peer, 'monday.md'), before);
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Daily note'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  const after = before.replaceAll('[ ]', '[x]') + '\n## Evening 18:45\nPractice finished.\n## Evening 19:26\nPersonal journal entry.\n';
+  fs.writeFileSync(path.join(f.vault, 'monday.md'), after);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(f.git(f.remote, 'show', 'main:monday.md'), after.trim());
+  fs.writeFileSync(path.join(f.vault, 'monday.md'), after.replace('[x] weight', '[ ] weight'));
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.ok(f.git(f.remote, 'show', 'main:monday.md').includes('[ ] weight'));
+});
+
+for (const action of ['sync', 'merge', 'helper']) test(`${action}: automatically combines task state and wording with both histories`, async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.vault, 'note.md'), '# Tasks\n- [ ] task\n');
+  f.git(f.vault, 'add', '.'); f.git(f.vault, 'commit', '-m', 'Base'); f.git(f.vault, 'push');
+  const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), '# Tasks\n- [ ] task today\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Wording'); f.git(peer, 'push');
+  const server = f.git(peer, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), '# Tasks\n- [x] task\n');
+  if (action === 'helper') {
+    cp.execFileSync(process.execPath, [path.join(__dirname, '..', 'main.js'), '--sync', f.vault], {
+      env: { ...process.env, HOME: f.dir, XDG_STATE_HOME: f.dir, LOCALAPPDATA: f.dir, GIT_CONFIG_GLOBAL: path.join(f.dir, 'empty.gitconfig') }, stdio: 'pipe',
+    });
+  } else {
+    const { instance } = load({ home: f.dir, vault: f.vault });
+    assert.equal(await instance.runAction(action), true, instance.feedback);
+  }
+  assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), '# Tasks\n- [x] task today\n');
+  f.git(f.vault, 'merge-base', '--is-ancestor', server, 'HEAD');
+  assert.equal(f.git(f.remote, 'show', 'main:note.md'), action === 'merge' ? '# Tasks\n- [ ] task today' : '# Tasks\n- [x] task today');
+});
+
+test('manual merge raises guided review; unresolved sections and stale review cannot be saved', async t => {
+  const f = fixture(t), peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'server\n'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'local\n');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.runAction('merge'), false);
+  assert.equal(instance.attention.kind, 'conflicts');
+  await instance.runAction('review'); const entry = instance.review[0];
+  assert.equal(entry.merge.clean, false);
+  const options = { path: entry.path, fingerprint: entry.fingerprint, choice: 'merged' };
+  assert.equal(await instance.runAction('resolve', options), false);
+  options.choices = Object.fromEntries(entry.merge.blocks.filter(b => b.conflict).map(b => [b.id, 'both']));
+  fs.appendFileSync(path.join(f.vault, 'note.md'), 'concurrent edit\n');
+  assert.equal(await instance.runAction('resolve', options), false);
+  assert.equal(f.git(f.remote, 'show', 'main:note.md'), 'server');
+});
+
+test('whole-file replacement previews newer content and rejects a stale confirmation', async t => {
+  const f = fixture(t), peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'today.md'), 'Protected timestamp\n- [ ] shower\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault }); await instance.syncVault();
+  fs.writeFileSync(path.join(f.vault, 'today.md'), '- [x] shower\nNew journal\n');
+  assert.equal(await instance.syncVault(), false);
+  const fingerprint = instance.attention.fingerprint;
+  assert.equal(await instance.runAction('replacement-preview', { fingerprint }), true, instance.feedback);
+  const text = instance.replacementPreview.files[0].blocks.flatMap(b => b.current).join('\n');
+  assert.ok(text.includes('New journal'));
+  assert.equal(await instance.runAction('recover', { fingerprint }), false);
+  fs.appendFileSync(path.join(f.vault, 'today.md'), 'later\n');
+  assert.equal(await instance.runAction('recover', { fingerprint, confirmReplacement: true }), false);
+  assert.ok(fs.readFileSync(path.join(f.vault, 'today.md'), 'utf8').includes('later'));
+});
+
+for (const kind of ['add/add', 'modify/delete']) test(`${kind}: preserves ambiguity for explicit review`, async t => {
+  const f = fixture(t), peer = makePeer(f);
+  if (kind === 'add/add') {
+    fs.writeFileSync(path.join(peer, 'new.md'), '- [ ] server task\n');
+    fs.writeFileSync(path.join(f.vault, 'new.md'), '- [x] local task\n');
+  } else {
+    f.git(peer, 'rm', 'note.md');
+    fs.writeFileSync(path.join(f.vault, 'note.md'), 'original\nLocal journal\n');
+  }
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server change'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.attention.kind, 'conflicts');
+  assert.equal(await instance.runAction('review'), true);
+  const entry = instance.review[0];
+  if (kind === 'add/add') {
+    assert.equal(entry.merge.clean, false);
+    assert.equal(await instance.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice: 'merged', choices: { 0: 'both' } }), true, instance.feedback);
+  } else {
+    assert.equal(entry.merge, undefined);
+    assert.equal(await instance.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice: 'phone' }), true, instance.feedback);
+  }
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  const result = f.git(f.remote, 'show', `main:${entry.path}`);
+  assert.ok(result.includes(kind === 'add/add' ? 'local task' : 'Local journal'));
+  if (kind === 'add/add') assert.ok(result.includes('server task'));
+});
+
+test('historical replacement rejects an edited file and retains binary whole-file recovery', async t => {
+  const f = fixture(t); const original = f.git(f.vault, 'rev-parse', 'HEAD');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  await instance.runAction('whole-preview', { path: 'note.md', oid: original });
+  const fingerprint = instance.recoveryPreview.fingerprint;
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'new journal\n');
+  assert.equal(await instance.runAction('restore-history', { path: 'note.md', oid: original, fingerprint, confirmReplacement: true }), false);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), 'new journal\n');
+  fs.writeFileSync(path.join(f.vault, 'binary.dat'), Buffer.from([0, 1, 2]));
+  f.git(f.vault, 'add', 'binary.dat'); f.git(f.vault, 'commit', '-m', 'Binary');
+  const oid = f.git(f.vault, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(f.vault, 'binary.dat'), Buffer.from([0, 3, 4]));
+  assert.equal(await instance.runAction('whole-preview', { path: 'binary.dat', oid }), true, instance.feedback);
+  assert.equal(instance.recoveryPreview.blocks, null);
+  assert.equal(await instance.runAction('restore-history', { path: 'binary.dat', oid, fingerprint: instance.recoveryPreview.fingerprint, confirmReplacement: true }), true, instance.feedback);
+  assert.deepEqual(fs.readFileSync(path.join(f.vault, 'binary.dat')), Buffer.from([0, 1, 2]));
+});
+
 function load({ home, vault, platform = process.platform, mobile = false, execute } = {}) {
   const notices = [];
   const commands = [];
@@ -19,7 +221,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
     empty() { this.children = []; }
     addClass() {}
     setAttribute(key, value) { this.attributes[key] = value; }
-    createEl(tag, options = {}) { const el = new Element(); el.textContent = options.text || ''; this.children.push(el); return el; }
+    createEl(tag, options = {}) { const el = new Element(); el.tag = tag; el.attributes = options.attr || {}; el.textContent = options.text || ''; this.children.push(el); return el; }
     createDiv(options) { return this.createEl('div', options); }
   }
   class Modal {
@@ -57,7 +259,8 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
   vm.runInNewContext(source, context);
   const instance = new context.module.exports();
   instance.app = { vault: { adapter: { getBasePath: () => vault } } };
-  return { instance, notices, commands, tabs, buttons, modals, api: context.module.exports };
+  return { instance, notices, commands, tabs, buttons, modals, api: context.module.exports,
+    ui: vm.runInNewContext('({ ConflictReviewModal, IncomingReplacementModal, HistoryRecoveryModal })', context) };
 }
 
 function fixture(t) {
@@ -523,7 +726,10 @@ test('unexpected loss of a received note is blocked and restored', async t => {
   assert.equal(await instance.syncVault(), false);
   assert.equal(instance.attention.kind, 'deletions');
   assert.equal(f.git(f.remote, 'show', 'main:today.md'), 'keep me');
-  assert.equal(await instance.runAction('recover'), true, instance.feedback);
+  const fingerprint = instance.attention.fingerprint;
+  assert.equal(await instance.runAction('recover'), false, 'Whole replacement requires explicit confirmation');
+  assert.equal(await instance.runAction('replacement-preview', { fingerprint }), true, instance.feedback);
+  assert.equal(await instance.runAction('recover', { fingerprint, confirmReplacement: true }), true, instance.feedback);
   assert.equal(await instance.syncVault(), true, instance.feedback);
   assert.equal(fs.readFileSync(path.join(f.vault, 'today.md'), 'utf8'), 'keep me\n');
   fs.unlinkSync(path.join(f.vault, 'today.md'));
@@ -580,7 +786,8 @@ test('file history recovery restores selected bytes and protects current edits w
   assert.ok(instance.history.some(item => item.oid === original));
   assert.equal(await instance.runAction('history-files', { oid: original }), true);
   assert.ok(instance.historyFiles.some(item => item.path === 'note.md'));
-  assert.equal(await instance.runAction('restore-history', { oid: original, path: 'note.md' }), true, instance.feedback);
+  assert.equal(await instance.runAction('whole-preview', { oid: original, path: 'note.md' }), true, instance.feedback);
+  assert.equal(await instance.runAction('restore-history', { oid: original, path: 'note.md', fingerprint: instance.recoveryPreview.fingerprint, confirmReplacement: true }), true, instance.feedback);
   assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), 'original\n');
   const copies = path.join(f.vault, '.git', 'vault-sync', 'copies');
   assert.ok(fs.readdirSync(copies).some(folder => fs.readFileSync(path.join(copies, folder, 'content'), 'utf8') === 'new work to protect\n'));
