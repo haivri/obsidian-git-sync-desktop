@@ -956,13 +956,13 @@ test('protected merge shows the exact final note and requires every passage choi
   assert.equal(result.action, 'merge-protected'); assert.equal(result.content, current);
 });
 
-test('protected merge preserves added wording, backs up current bytes and rejects stale review', async t => {
+test('protected merge preserves reviewed wording, backs up current bytes and rejects stale review', async t => {
   const f = fixture(t), peer = makePeer(f);
   const saved = '# Today\n- [x] supplies\n';
   fs.writeFileSync(path.join(peer, 'daily.md'), saved); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Saved note'); f.git(peer, 'push');
   const { instance, api } = load({ home: f.dir, vault: f.vault });
   assert.equal(await instance.syncVault(), true, instance.feedback);
-  const current = '# Today\n- [x] supplies (ordered; arriving tomorrow)\n';
+  const current = '# Today\n- [x] groceries (ordered; arriving tomorrow)\n';
   fs.writeFileSync(path.join(f.vault, 'daily.md'), current);
   assert.equal(await instance.syncVault(), false);
   const fingerprint = instance.attention.fingerprint;
@@ -986,4 +986,79 @@ test('protected merge preserves added wording, backs up current bytes and reject
   assert.equal(await instance.syncVault(), true, instance.feedback);
   assert.equal(f.git(f.remote, 'show', 'main:daily.md'), options.content.trim());
   assert.equal(await instance.syncVault(), true, 'Reviewed content should not trigger the warning again');
+});
+
+
+test('additive note edits preserve full words, punctuation, duplicate counts and task context', () => {
+  const { api } = load();
+  for (const [saved, current] of [
+    ['- [x] supplies, water\n', '- [x] supplies (ordered; arriving tomorrow), water\n'],
+    ['Morning: practice.\n', 'Morning: gentle practice (done).\n'],
+    ['# Core\n- [ ] practice\n', '# Core\n- [x] gentle practice (done)\nNew journal paragraph.\n'],
+    ['one\ntwo\n', 'New heading\none plus\nnew paragraph\ntwo more\n'],
+    ['🧘 café\r\n', '🧘 café (today)\r\n'],
+    ['_practice_\n', '_practice (done)_\n'],
+    ['# Core\n- [ ] task\n', '# Core today\n- [x] task (done)\n'],
+  ]) assert.equal(api.missingLines(saved, current).length, 0, JSON.stringify({ saved, current }));
+  for (const [saved, current] of [
+    ['cat\n', 'concatenate\n'],
+    ['10 mg\n', '100 mg\n'],
+    ['keep this sentence.\n', 'keep this sentence\n'],
+    ['keep\nkeep\n', 'keep (extra)\n'],
+    ['- [ ] same\n- [ ] same\n', '- [x] same (extra)\n'],
+    ['alpha\nbeta\n', 'alpha beta\n'],
+    ['# First\n- [ ] task\n# Second\n', '# First\n# Second\n- [x] task (extra)\n'],
+  ]) assert.ok(api.missingLines(saved, current).length, JSON.stringify({ saved, current }));
+});
+
+for (const action of ['sync', 'merge', 'helper']) test(`${action}: additive edits to received text save without review`, async t => {
+  const f = fixture(t), peer = makePeer(f);
+  const saved = '# Core\n- [ ] supplies, water\nJournal: practice.\n';
+  fs.writeFileSync(path.join(peer, 'daily.md'), saved); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Incoming daily note'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  const current = '# Core\n- [x] supplies (ordered; arriving tomorrow), water\nJournal: gentle practice (done).\nNew paragraph.\n';
+  fs.writeFileSync(path.join(f.vault, 'daily.md'), current);
+  if (action === 'helper') cp.execFileSync(process.execPath, [path.join(__dirname, '..', 'main.js'), '--sync', f.vault], {
+    env: { ...process.env, HOME: f.dir, XDG_STATE_HOME: f.dir, LOCALAPPDATA: f.dir, GIT_CONFIG_GLOBAL: path.join(f.dir, 'empty.gitconfig') }, stdio: 'pipe',
+  });
+  else {
+    assert.equal(await instance.runAction(action), true, instance.feedback);
+    assert.equal(instance.attention, null);
+    if (action === 'merge') assert.equal(await instance.runAction('push'), true, instance.feedback);
+  }
+  assert.equal(fs.readFileSync(path.join(f.vault, 'daily.md'), 'utf8'), current);
+  assert.equal(f.git(f.remote, 'show', 'main:daily.md'), current.trim());
+  // Adding unrelated text must never excuse removing protected wording.
+  fs.writeFileSync(path.join(f.vault, 'daily.md'), current.replace('supplies', 'groceries') + 'Another paragraph.\n');
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.attention.kind, 'deletions');
+  assert.equal(f.git(f.remote, 'show', 'main:daily.md'), current.trim());
+});
+
+test('overlapping additions keep the version containing both sides; replacements still need review', () => {
+  const { api } = load();
+  const base = 'Plan: walk.\n', server = 'Plan: gentle walk.\n', current = 'Plan: gentle walk (done).\n';
+  const merged = api.mergeNote(base, current, server);
+  assert.equal(merged.clean, true); assert.equal(api.renderMerge(merged), current);
+  assert.equal(api.renderMerge(api.mergeNote(base, server, current)), current);
+  assert.equal(api.mergeNote(base, 'Plan: run (done).\n', server).clean, false);
+  assert.equal(api.mergeNote('- [ ] task\n', '- [x] task today\n', '- [-] task today\n').clean, false);
+});
+
+test('diverged histories automatically merge when local wording contains all server additions', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.vault, 'note.md'), 'Plan: walk.\n');
+  f.git(f.vault, 'add', '.'); f.git(f.vault, 'commit', '-m', 'Shared plan'); f.git(f.vault, 'push');
+  const peer = makePeer(f);
+  fs.writeFileSync(path.join(peer, 'note.md'), 'Plan: gentle walk.\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server addition'); f.git(peer, 'push');
+  const current = 'Plan: gentle walk (done).\n';
+  fs.writeFileSync(path.join(f.vault, 'note.md'), current);
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(instance.attention, null);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'note.md'), 'utf8'), current);
+  assert.equal(f.git(f.remote, 'show', 'main:note.md'), current.trim());
+  assert.equal(f.git(f.vault, 'ls-files', '-u'), '');
 });

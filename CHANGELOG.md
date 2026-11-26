@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.2
+
+- Automatically save additive edits to received notes when the saved words and punctuation remain present, including inline explanations and task completion changes.
+- Resolve overlapping additive Markdown edits by keeping the version that contains both sides.
+- Keep review for removed or replaced text, ambiguous repeated passages, and incompatible task states.
+
 ## 1.7.1
 
 - Show saved and current text side by side in unexpected-change review, highlight differences, and identify added text without calling it a Git conflict.

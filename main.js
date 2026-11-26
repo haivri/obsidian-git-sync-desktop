@@ -787,8 +787,18 @@ function taskLines(text) {
     if (fence) return { line };
     if (/^\s{0,3}#{1,6}\s/.test(line)) section = line;
     const task = /^(\s*(?:[-+*]|\d+[.)])\s+\[)([^\]\r\n])(\]\s+)(.*)$/.exec(line);
-    return task ? { line, task, key: JSON.stringify([section, task[1], task[3], task[4]]) } : { line };
+    return task ? { line, task, section, key: JSON.stringify([section, task[1], task[3], task[4]]) } : { line };
   });
+}
+// Preserve complete words, punctuation and whitespace in order. Word tokens
+// prevent a replacement such as "cat" -> "concatenate" from looking additive.
+function insertionOnly(before, after) {
+  if (before === after) return true;
+  if (after.length <= before.length) return false;
+  const tokens = text => text.match(/[\p{L}\p{N}\p{M}]+|[^\p{L}\p{N}\p{M}]/gu) || [];
+  const original = tokens(before); let at = 0;
+  for (const token of tokens(after)) if (at < original.length && token === original[at]) at++;
+  return at === original.length;
 }
 function missingLines(expected, current) {
   const before = taskLines(expected), after = taskLines(current);
@@ -801,13 +811,35 @@ function missingLines(expected, current) {
   // Ambiguous repeated tasks retain strict protection; never hide a deleted copy.
   const key = row => row.key && oldCounts.get(row.key) === 1 && newCounts.get(row.key) === 1
     ? 'task:' + row.key : 'line:' + row.line;
-  const counts = new Map();
-  for (const row of after) counts.set(key(row), (counts.get(key(row)) || 0) + 1);
-  return before.filter(row => {
+  const available = new Map();
+  for (const row of after) { const k = key(row); if (!available.has(k)) available.set(k, []); available.get(k).push(row); }
+  const missing = before.filter(row => {
     const k = key(row);
-    if (counts.get(k)) { counts.set(k, counts.get(k) - 1); return false; }
+    if (available.get(k)?.length) { available.get(k).pop(); return false; }
     return row.line.length > 0; // An absent final newline is not lost text.
-  }).map(row => row.line);
+  });
+  const remaining = [...available.values()].flat();
+  if (missing.length * remaining.length > 4000000) return missing.map(row => row.line);
+  const identities = rows => {
+    const counts = new Map();
+    for (const row of rows) { const id = row.key || row.line; counts.set(id, (counts.get(id) || 0) + 1); }
+    return counts;
+  };
+  const oldIdentities = identities(before), newIdentities = identities(after);
+  const candidates = missing.map(row => {
+    if (oldIdentities.get(row.key || row.line) !== 1) return [];
+    return remaining.filter(candidate => {
+      if (newIdentities.get(candidate.key || candidate.line) !== 1 || !!row.task !== !!candidate.task) return false;
+      if (row.task) return insertionOnly(row.section, candidate.section) && row.task[1] === candidate.task[1] && row.task[3] === candidate.task[3]
+        && insertionOnly(row.task[4], candidate.task[4]);
+      return insertionOnly(row.line, candidate.line);
+    });
+  });
+  // Each added-to line must match exactly one old line, in both directions.
+  // Never use one surviving passage to excuse removal of a second copy.
+  const uses = new Map();
+  for (const list of candidates) for (const row of list) uses.set(row, (uses.get(row) || 0) + 1);
+  return missing.filter((row, i) => candidates[i].length !== 1 || uses.get(candidates[i][0]) !== 1).map(row => row.line);
 }
 function recoveryBlocks(current, historical) {
   const a = noteLines(current), b = noteLines(historical);
@@ -874,6 +906,10 @@ function mergeNote(base, local, server) {
     const original = b.slice(start, end), left = variant('local'), right = variant('server');
     let result = scalar(JSON.stringify(original), JSON.stringify(left), JSON.stringify(right));
     result = result === null ? null : JSON.parse(result);
+    if (result === null && insertionOnly(original.join('\n'), left.join('\n')) && insertionOnly(original.join('\n'), right.join('\n'))) {
+      if (insertionOnly(right.join('\n'), left.join('\n'))) result = left;
+      else if (insertionOnly(left.join('\n'), right.join('\n'))) result = right;
+    }
     if (result === null && original.length === left.length && original.length === right.length) {
       const combined = original.map((line, i) => {
         const ordinary = scalar(line, left[i], right[i]);

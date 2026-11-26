@@ -2,6 +2,9 @@
 
 - Keep the canonical source identical to both installed vault copies.
 - Preserve the left-ribbon sync command and visible failure reporting.
+- Additive note edits that preserve the saved text should sync automatically,
+  keeping the containing version. Reserve review for actual loss, replacement,
+  or ambiguous/incompatible edits.
 - Recovery screens must use plain language, show both versions and their
   differences, provide an explicit merge preview, and name exactly what each
   action keeps or replaces. Keep destructive restoration separate, use large

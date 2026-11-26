@@ -91,8 +91,8 @@ same commit. Offline work stays saved locally and retries with backoff.
 Automatic successes are quiet; a review remains visible until you resolve it.
 
 **Review before syncing** shows the saved copy beside your current note, with
-changed text highlighted. A wording edit can trigger this protection even when
-there is no Git merge conflict. **Keep my current note and sync** preserves your
+changed text highlighted. Additive edits sync automatically when all saved wording remains present.
+Removed or replaced text still opens this review, even without a Git merge conflict. **Keep my current note and sync** preserves your
 current text. **Merge versions…** lets you choose each changed passage and edit
 the complete final note before **Save this merged note and sync**. Nothing is
 changed by opening either preview. Older-copy replacement is a separate,
