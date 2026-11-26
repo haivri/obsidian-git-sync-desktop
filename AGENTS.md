@@ -2,6 +2,10 @@
 
 - Keep the canonical source identical to both installed vault copies.
 - Preserve the left-ribbon sync command and visible failure reporting.
+- Recovery screens must use plain language, show both versions and their
+  differences, provide an explicit merge preview, and name exactly what each
+  action keeps or replaces. Keep destructive restoration separate, use large
+  controls and clear spacing, and always offer an exit that changes nothing.
 - Do not place vault credentials, remote tokens, or machine-specific paths in
   this repository.
 - Before committing a release, verify existing installed hashes and preserve

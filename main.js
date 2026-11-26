@@ -94,7 +94,7 @@ class SyncEngine {
   supported() { return ['darwin', 'win32', 'linux'].includes(process.platform); }
   openSetup() {}
   async runAction(action, options = {}) {
-    if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force', 'inspect', 'prepare', 'connect', 'upload', 'review', 'resolve', 'recover', 'replacement-preview', 'whole-preview', 'approve-deletions', 'history', 'history-files', 'restore-history', 'recovery-notes', 'note-history', 'recovery-preview', 'restore-selection'].includes(action)) return false;
+    if (!['sync', 'commit', 'pull', 'merge', 'push', 'status', 'finish', 'force', 'inspect', 'prepare', 'connect', 'upload', 'review', 'resolve', 'recover', 'replacement-preview', 'whole-preview', 'approve-deletions', 'merge-protected', 'history', 'history-files', 'restore-history', 'recovery-notes', 'note-history', 'recovery-preview', 'restore-selection'].includes(action)) return false;
     if (action === 'force' && !['ours', 'theirs'].includes(options.preference)) return false;
     if (!this.supported()) {
       new Notice('Git Sync Desktop requires desktop Obsidian on macOS, Windows, or Linux.', 10000);
@@ -367,6 +367,11 @@ class SyncEngine {
       if (action === 'replacement-preview') {
         this.replacementPreview = await safety.replacementPreview(options.fingerprint);
         this.outcome = previousOutcome; this.report(previousFeedback); return true;
+      }
+      if (action === 'merge-protected') {
+        await safety.mergeProtected(options);
+        this.outcome = { kind: 'pending' };
+        return done('Your previewed note is saved on this computer. Ready to sync.');
       }
       if (action === 'recover') {
         if (!options.confirmReplacement) throw new Error('Preview and confirm whole-file replacement first.');
@@ -1179,15 +1184,34 @@ class SyncSafety {
     for (const name of losses.paths) {
       const entry = (this.data.incoming || []).find(x => x.path === name);
       const oid = entry?.expected || await this.git('rev-parse', `HEAD:${name}`);
-      let current = require('node:buffer').Buffer.alloc(0);
+      let current = require('node:buffer').Buffer.alloc(0), deleted = false;
       try { current = await this.fs.readFile(await this.safePath(name)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      try { await this.fs.access(await this.safePath(name)); } catch (error) { if (error.code !== 'ENOENT') throw error; deleted = true; }
       const replacement = await this.gitBytes('cat-file', 'blob', oid);
       let blocks = null;
       try { blocks = recoveryBlocks(decodeNote(current), decodeNote(replacement)); } catch { }
-      files.push({ path: name, blocks, currentBytes: current.length, replacementBytes: replacement.length });
+      files.push({ path: name, blocks, deleted, currentBytes: current.length, replacementBytes: replacement.length });
     }
     if ((await this.suspiciousLosses())?.fingerprint !== fingerprint) throw new Error('The files changed. Review them again.');
     return { fingerprint, files };
+  }
+  async mergeProtected(options) {
+    if (this.data.pending || (await this.conflicts()).length) throw new Error('Finish the current Git merge first.');
+    const preview = await this.replacementPreview(options.fingerprint);
+    const entry = preview.files.find(file => file.path === options.path);
+    if (!entry?.blocks || !/\.md$/i.test(options.path)) throw new Error('This file cannot be merged as a note.');
+    renderProtectedMerge(entry.blocks, options.choices); // Require an explicit choice for every differing passage.
+    if (typeof options.content !== 'string' || /^(<<<<<<< |=======\s*$|>>>>>>> )/m.test(options.content)) throw new Error('Review the complete merged note before saving.');
+    await this.protect(); await this.backupFile(options.path);
+    if ((await this.suspiciousLosses())?.fingerprint !== options.fingerprint) throw new Error('The files changed. Review the latest versions first.');
+    const file = await this.safePath(options.path);
+    await this.fs.mkdir(this.path.dirname(file), { recursive: true });
+    await this.fs.writeFile(file, options.content);
+    await this.git('add', '--', options.path);
+    const expected = await this.git('hash-object', '-w', '--path', options.path, '--', file);
+    this.data.incoming = (this.data.incoming || []).filter(entry => entry.path !== options.path);
+    this.data.incoming.push({ path: options.path, expected, previous: null });
+    this.data.approved = null; this.data.approval = null; await this.save();
   }
   async combineConflicts(error) {
     const entries = await this.conflicts();
@@ -1358,27 +1382,115 @@ class ConflictReviewModal extends Modal {
   }
 }
 
+// This is a comparison with a protected saved copy, not necessarily the latest server.
+function showChangedPassage(container, current, saved) {
+  let prefix = 0, suffix = 0;
+  while (prefix < current.length && prefix < saved.length && current[prefix] === saved[prefix]) prefix++;
+  while (suffix < current.length - prefix && suffix < saved.length - prefix && current[current.length - 1 - suffix] === saved[saved.length - 1 - suffix]) suffix++;
+  if (current.length > saved.length && prefix + suffix === saved.length) container.createEl('p', { text: 'Your current version adds text here. The saved wording is still present.' });
+  const grid = container.createDiv({ cls: 'vault-sync-compare' });
+  for (const [text, title, kind] of [[saved, 'Saved copy · before this edit', 'saved'], [current, 'Your current note · on this computer', 'current']]) {
+    const pane = grid.createDiv(); pane.createEl('h4', { text: title });
+    const pre = pane.createEl('pre', { cls: 'vault-sync-recovery-text' });
+    if (!text) { pre.createEl('span', { text: '(No text in this version)' }); continue; }
+    pre.createEl('span', { text: text.slice(0, prefix) });
+    pre.createEl('mark', { cls: `vault-sync-change-${kind}`, text: text.slice(prefix, text.length - suffix) });
+    pre.createEl('span', { text: suffix ? text.slice(-suffix) : '' });
+  }
+}
+function renderProtectedMerge(blocks, choices = {}) {
+  return blocks.flatMap(block => {
+    if (block.shared) return block.current;
+    const choice = choices[block.id];
+    if (!['current', 'historical', 'both'].includes(choice)) throw new Error('Choose what to keep in every changed passage.');
+    return choice === 'both' ? [...block.current, ...block.historical] : block[choice];
+  }).join('\n');
+}
 class DeletionReviewModal extends Modal {
   constructor(app, plugin) { super(app); this.plugin = plugin; this.losses = plugin.attention; }
-  onOpen() {
-    this.plugin.reviewOpen = true; this.setTitle('Review unexpected changes');
-    this.contentEl.createEl('p', { text: 'These changes may remove recently received work or a large group of files. Previous versions are protected. Choose whether to restore them or apply these exact changes.' });
-    for (const name of this.losses?.paths || []) {
-      this.contentEl.createEl('h3', { text: name });
-      const detail = this.losses.details?.find(x => x.path === name);
-      if (detail) {
-        this.contentEl.createEl('p', { text: detail.reason });
-        this.contentEl.createEl('pre', { cls: 'vault-sync-recovery-text', text: detail.removed.join('\n') });
-      }
-      const entry = this.plugin;
-      if (/\.md$/i.test(name)) new Setting(this.contentEl).addButton(b => b.setButtonText('Choose text to restore').onClick(() => { this.close(); new HistoryRecoveryModal(this.app, entry, name).open(); }));
+  onOpen() { this.plugin.reviewOpen = true; this.setTitle('Review before syncing'); void this.render(); }
+  onClose() { this.closed = true; this.plugin.reviewOpen = false; }
+  async render() {
+    const root = this.contentEl; root.empty(); root.addClass('vault-sync-clear-review');
+    root.createEl('p', { text: 'Loading both versions…', attr: { role: 'status' } });
+    const ok = await this.plugin.runAction('replacement-preview', { fingerprint: this.losses.fingerprint });
+    if (this.closed) return;
+    root.empty();
+    if (!ok) {
+      root.createEl('p', { text: 'The files changed while this review was open. Close this window and sync again to see the latest versions.' });
+      new Setting(root).addButton(b => b.setButtonText('Close without changing anything').onClick(() => this.close()));
+      return;
     }
-    this.contentEl.createEl('p', { text: 'Whole-file restoration replaces newer text and checkboxes. Current files are backed up first.' });
-    new Setting(this.contentEl).addButton(b => b.setButtonText('Preview whole-file replacement').onClick(() => { this.close(); this.plugin.openReplacementReview(this.losses.fingerprint); }))
-      .addButton(b => b.setButtonText('Apply these changes').onClick(async () => {
-        const ok = await this.plugin.runAction('approve-deletions', { fingerprint: this.losses.fingerprint });
-        this.close(); if (ok) await this.plugin.syncVault();
-      }));
+    const files = this.plugin.replacementPreview.files;
+    root.createEl('h3', { text: 'Your changes are paused. Nothing has been replaced.' });
+    root.createEl('p', { text: 'A note changed after it arrived from another device. This can be an ordinary edit. Compare the saved copy with your current note below.' });
+    root.createEl('p', { text: `${files.length} ${files.length === 1 ? 'file needs' : 'files need'} review. Highlighted text is different. Both copies stay available in recovery history.` });
+    for (const file of files) {
+      const card = root.createDiv({ cls: 'vault-git-sync-review' });
+      card.createEl('h3', { text: file.path.split('/').pop() });
+      const location = card.createEl('details'); location.createEl('summary', { text: 'File location' }); location.createEl('p', { text: file.path });
+      if (file.deleted) card.createEl('p', { text: 'This file is deleted on this computer. Keeping the current version will also delete it on your other devices after sync.' });
+      if (file.blocks) {
+        const changed = file.blocks.filter(block => !block.shared);
+        if (!changed.length) card.createEl('p', { text: 'The note text matches the saved copy. Git’s staged version may differ; keeping current uses the note shown here.' });
+        changed.forEach((block, index) => {
+          card.createEl('h4', { text: `Changed passage ${index + 1} of ${changed.length}` });
+          showChangedPassage(card, block.current.join('\n'), block.historical.join('\n'));
+        });
+        const full = card.createEl('details'); full.createEl('summary', { text: 'Read both complete versions' });
+        showChangedPassage(full, file.blocks.flatMap(b => b.current).join('\n'), file.blocks.flatMap(b => b.historical).join('\n'));
+        if (/\.md$/i.test(file.path)) new Setting(card).setDesc('Choose passages from either copy, then read the complete result before saving.')
+          .addButton(b => b.setButtonText('Merge versions…').onClick(() => { this.close(); new ProtectedMergeModal(this.app, this.plugin, this.losses.fingerprint, file).open(); }));
+      } else card.createEl('p', { text: `A text comparison is unavailable for this file. Saved copy: ${file.replacementBytes} bytes. Current copy: ${file.currentBytes} bytes. Close this review to inspect it in its own app before choosing.` });
+    }
+    const deleted = files.some(file => file.deleted);
+    root.createEl('h3', { text: 'Keep your current version?' });
+    root.createEl('p', { text: deleted ? 'This saves the current files and deletions, then syncs them to your other devices. It does not restore the saved copies.' : 'This keeps the current text shown above, including your latest edits. It saves and syncs your vault to your other devices.' });
+    new Setting(root).addButton(b => b.setButtonText(deleted ? 'Keep current files and deletions, then sync' : files.length === 1 ? 'Keep my current note and sync' : 'Keep all current versions and sync').setCta().onClick(async () => {
+      if (this.busy) return; this.busy = true; b.setDisabled(true);
+      const saved = await this.plugin.runAction('approve-deletions', { fingerprint: this.losses.fingerprint });
+      if (saved) { this.close(); await this.plugin.syncVault(); }
+      else { this.busy = false; b.setDisabled(false); new Notice(this.plugin.feedback, 15000); }
+    })).addButton(b => b.setButtonText('Decide later — change nothing').onClick(() => this.close()));
+    const restore = root.createEl('details'); restore.createEl('summary', { text: 'Restore older copies instead…' });
+    restore.createEl('p', { text: 'This can remove your latest edits. You will see a separate replacement preview before anything changes.' });
+    new Setting(restore).addButton(b => b.setButtonText('Preview replacing current files').onClick(() => { this.close(); this.plugin.openReplacementReview(this.losses.fingerprint); }));
+  }
+}
+class ProtectedMergeModal extends Modal {
+  constructor(app, plugin, fingerprint, file) { super(app); Object.assign(this, { plugin, fingerprint, file }); }
+  onOpen() {
+    this.plugin.reviewOpen = true; this.setTitle('Merge this note');
+    const root = this.contentEl; root.addClass('vault-sync-clear-review');
+    root.createEl('h3', { text: this.file.path.split('/').pop() });
+    root.createEl('p', { text: '1. Choose what to keep in each changed passage. 2. Read the final note. 3. Save and sync when it looks right.' });
+    const choices = {}; const changed = this.file.blocks.filter(b => !b.shared);
+    const progress = root.createEl('p', { attr: { role: 'status', 'aria-live': 'polite' } });
+    let input, save;
+    const update = () => {
+      const remaining = changed.filter(b => !choices[b.id]).length;
+      progress.textContent = remaining ? `${remaining} ${remaining === 1 ? 'passage needs' : 'passages need'} a choice. Nothing has been saved.` : 'Ready to review. The full note below is exactly what will be saved.';
+      input.value = renderProtectedMerge(this.file.blocks, Object.fromEntries(changed.map(b => [b.id, choices[b.id] || 'current'])));
+      input.disabled = remaining > 0; save.setDisabled(remaining > 0);
+    };
+    for (const [index, block] of changed.entries()) {
+      const card = root.createDiv({ cls: 'vault-git-sync-review' });
+      card.createEl('h3', { text: `Passage ${index + 1} of ${changed.length}` });
+      showChangedPassage(card, block.current.join('\n'), block.historical.join('\n'));
+      const selected = card.createEl('p', { text: 'No choice yet', attr: { role: 'status' } });
+      const row = new Setting(card);
+      for (const [choice, label] of [['current', 'Keep my current text'], ['historical', 'Use saved text instead'], ['both', 'Keep both passages']]) row.addButton(b => b.setButtonText(label).onClick(() => { choices[block.id] = choice; selected.textContent = `Selected: ${label}`; update(); }));
+    }
+    root.createEl('h3', { text: 'Final note · this is what will be saved' });
+    root.createEl('p', { text: 'You can edit this preview after choosing every passage. Changing a passage choice rebuilds the preview and replaces any typing here.' });
+    input = root.createEl('textarea', { cls: 'vault-git-sync-result', attr: { 'aria-label': 'Final note to save' } });
+    new Setting(root).addButton(b => { save = b; b.setButtonText('Save this merged note and sync').setCta().onClick(async () => {
+      if (this.busy) return; this.busy = true; b.setDisabled(true);
+      const ok = await this.plugin.runAction('merge-protected', { path: this.file.path, fingerprint: this.fingerprint, choices, content: input.value });
+      if (ok) { this.close(); await this.plugin.syncVault(); }
+      else { this.busy = false; b.setDisabled(false); new Notice(this.plugin.feedback, 15000); }
+    }); }).addButton(b => b.setButtonText('Cancel — keep everything unchanged').onClick(() => this.close()));
+    update();
   }
   onClose() { this.plugin.reviewOpen = false; }
 }
@@ -1561,3 +1673,5 @@ module.exports.renderRecovery = renderRecovery;
 module.exports.missingLines = missingLines;
 module.exports.mergeNote = mergeNote;
 module.exports.renderMerge = renderMerge;
+
+module.exports.renderProtectedMerge = renderProtectedMerge;

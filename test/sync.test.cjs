@@ -260,7 +260,7 @@ function load({ home, vault, platform = process.platform, mobile = false, execut
   const instance = new context.module.exports();
   instance.app = { vault: { adapter: { getBasePath: () => vault } } };
   return { instance, notices, commands, tabs, buttons, modals, api: context.module.exports,
-    ui: vm.runInNewContext('({ ConflictReviewModal, IncomingReplacementModal, HistoryRecoveryModal })', context) };
+    ui: vm.runInNewContext('({ ConflictReviewModal, IncomingReplacementModal, HistoryRecoveryModal, DeletionReviewModal, ProtectedMergeModal })', context) };
 }
 
 function fixture(t) {
@@ -917,4 +917,73 @@ test('local save time precedes slow networking and no-op sync does not advance i
   const savedAt = instance.savedAt;
   assert.equal(await instance.syncVault(), true, instance.feedback);
   assert.equal(instance.savedAt, savedAt);
+});
+
+
+test('unexpected-change review shows both versions and explicit actions before any mutation', async () => {
+  const { api, ui, buttons } = load(); const actions = [];
+  const current = '- [x] supplies (ordered; arriving tomorrow)\n';
+  const saved = '- [x] supplies\n';
+  const plugin = { attention: { fingerprint: 'reviewed' }, replacementPreview: { files: [{ path: 'daily.md', blocks: api.recoveryBlocks(current, saved), currentBytes: current.length, replacementBytes: saved.length }] },
+    async runAction(action) { actions.push(action); return true; }, async syncVault() { actions.push('sync'); } };
+  const modal = new ui.DeletionReviewModal({}, plugin); await modal.render();
+  const text = el => [el.textContent, ...el.children.flatMap(text)].join('\n');
+  assert.match(text(modal.contentEl), /Saved copy · before this edit/);
+  assert.match(text(modal.contentEl), /Your current note · on this computer/);
+  assert.match(text(modal.contentEl), /ordered; arriving tomorrow/);
+  assert.ok(buttons.some(b => b.text === 'Merge versions…'));
+  assert.ok(!buttons.some(b => b.text === 'Apply these changes'));
+  assert.deepEqual(actions, ['replacement-preview']);
+  await buttons.find(b => b.text === 'Keep my current note and sync').callback();
+  assert.deepEqual(actions, ['replacement-preview', 'approve-deletions', 'sync']);
+});
+
+test('protected merge shows the exact final note and requires every passage choice', async () => {
+  const { api, ui, buttons } = load(); let result;
+  const current = 'heading\nnew wording\ncontext\nnew ending\n';
+  const saved = 'heading\nold wording\ncontext\nold ending\n';
+  const plugin = { async runAction(action, options) { result = { action, ...options }; return true; }, async syncVault() {} };
+  const modal = new ui.ProtectedMergeModal({}, plugin, 'reviewed', { path: 'note.md', blocks: api.recoveryBlocks(current, saved) }); modal.onOpen();
+  const flatten = el => [el, ...el.children.flatMap(flatten)];
+  const input = flatten(modal.contentEl).find(el => el.tag === 'textarea');
+  const save = buttons.find(b => b.text === 'Save this merged note and sync');
+  assert.equal(save.disabled, true); assert.equal(result, undefined);
+  await buttons.filter(b => b.text === 'Keep my current text')[0].callback();
+  assert.equal(save.disabled, true);
+  await buttons.filter(b => b.text === 'Keep my current text')[1].callback();
+  assert.equal(save.disabled, false); assert.equal(input.value, current);
+  await save.callback();
+  assert.equal(result.action, 'merge-protected'); assert.equal(result.content, current);
+});
+
+test('protected merge preserves added wording, backs up current bytes and rejects stale review', async t => {
+  const f = fixture(t), peer = makePeer(f);
+  const saved = '# Today\n- [x] supplies\n';
+  fs.writeFileSync(path.join(peer, 'daily.md'), saved); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Saved note'); f.git(peer, 'push');
+  const { instance, api } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  const current = '# Today\n- [x] supplies (ordered; arriving tomorrow)\n';
+  fs.writeFileSync(path.join(f.vault, 'daily.md'), current);
+  assert.equal(await instance.syncVault(), false);
+  const fingerprint = instance.attention.fingerprint;
+  assert.equal(await instance.runAction('replacement-preview', { fingerprint }), true);
+  const blocks = instance.replacementPreview.files[0].blocks;
+  const choices = Object.fromEntries(blocks.filter(b => !b.shared).map(b => [b.id, 'current']));
+  assert.equal(api.renderProtectedMerge(blocks, choices), current);
+  const options = { fingerprint, path: 'daily.md', choices, content: current };
+  assert.equal(await instance.runAction('merge-protected', { ...options, choices: {} }), false);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'daily.md'), 'utf8'), current);
+  fs.writeFileSync(path.join(f.vault, 'daily.md'), current + 'Newer writing\n');
+  assert.equal(await instance.runAction('merge-protected', options), false);
+  assert.equal(fs.readFileSync(path.join(f.vault, 'daily.md'), 'utf8'), current + 'Newer writing\n');
+  await instance.syncVault(); options.fingerprint = instance.attention.fingerprint;
+  await instance.runAction('replacement-preview', { fingerprint: options.fingerprint });
+  options.choices = Object.fromEntries(instance.replacementPreview.files[0].blocks.filter(b => !b.shared).map(b => [b.id, 'current']));
+  options.content = current + 'Newer writing\n';
+  assert.equal(await instance.runAction('merge-protected', options), true, instance.feedback);
+  const copies = path.join(f.vault, '.git', 'vault-sync', 'copies');
+  assert.ok(fs.readdirSync(copies).some(name => fs.readFileSync(path.join(copies, name, 'content'), 'utf8') === options.content));
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(f.git(f.remote, 'show', 'main:daily.md'), options.content.trim());
+  assert.equal(await instance.syncVault(), true, 'Reviewed content should not trigger the warning again');
 });

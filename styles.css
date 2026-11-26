@@ -39,3 +39,19 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: 0.5rem;
 }
+
+.modal:has(.vault-sync-clear-review) { width: min(960px, 94vw); }
+.vault-sync-clear-review { line-height: 1.6; }
+.vault-sync-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.vault-sync-compare h4 { font-size: 1em; margin-block: 12px 6px; }
+.vault-sync-compare pre { margin-top: 0; }
+.vault-sync-compare mark { color: var(--text-normal); background: var(--text-highlight-bg); font-weight: 600; }
+.vault-sync-clear-review .setting-item { flex-wrap: wrap; gap: 12px; }
+.vault-sync-clear-review .setting-item-control { flex-wrap: wrap; gap: 12px; }
+.vault-sync-clear-review button { min-height: 44px; white-space: normal; height: auto; padding: 10px 16px; }
+.vault-sync-clear-review summary { cursor: pointer; padding-block: 10px; }
+.vault-sync-clear-review textarea { min-height: 22rem; line-height: 1.6; }
+@media (max-width: 700px) {
+  .vault-sync-compare { grid-template-columns: 1fr; }
+  .vault-sync-clear-review .setting-item-control, .vault-sync-clear-review button { width: 100%; }
+}

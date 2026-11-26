@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.1
+
+- Show saved and current text side by side in unexpected-change review, highlight differences, and identify added text without calling it a Git conflict.
+- Add a visible Merge versions action with passage choices and a complete editable final-note preview. Back up current content and reject stale reviews before saving.
+- Replace ambiguous Apply these changes with explicit keep-current-and-sync labels, clear deletion consequences, and a separate older-copy restoration preview.
+- Use readable spacing, responsive comparison columns, large controls, and an explicit no-change exit.
+
 ## 1.7.0
 
 - Treat checking and unchecking an unambiguous Markdown task as state changes, while continuing to protect removed task text, journal entries, duplicate tasks, and fenced examples.

@@ -90,6 +90,14 @@ working copy is clean, attachments passed verification, and the server has the
 same commit. Offline work stays saved locally and retries with backoff.
 Automatic successes are quiet; a review remains visible until you resolve it.
 
+**Review before syncing** shows the saved copy beside your current note, with
+changed text highlighted. A wording edit can trigger this protection even when
+there is no Git merge conflict. **Keep my current note and sync** preserves your
+current text. **Merge versions…** lets you choose each changed passage and edit
+the complete final note before **Save this merged note and sync**. Nothing is
+changed by opening either preview. Older-copy replacement is a separate,
+explicitly labeled option. Reviews reject stale choices if files change.
+
 **Review your files** lists the affected files directly. Compare the common
 ancestor, computer, and server previews, inspect differing Obsidian settings,
 choose a version, combine text, or keep both note copies. Markdown drafts retain
