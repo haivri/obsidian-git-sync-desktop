@@ -55,3 +55,18 @@
   .vault-sync-compare { grid-template-columns: 1fr; }
   .vault-sync-clear-review .setting-item-control, .vault-sync-clear-review button { width: 100%; }
 }
+
+/* One conflict, one card. Three panes side by side; changed words marked. */
+.vault-sync-compare-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.vault-sync-pane h4 { font-size: .85em; letter-spacing: .04em; text-transform: uppercase; color: var(--text-muted); }
+.vault-sync-pane-base pre { color: var(--text-muted); }
+.vault-sync-pane-local pre, .vault-sync-pane-server pre { border-color: var(--interactive-accent); }
+.vault-sync-empty { color: var(--text-faint); font-style: italic; }
+.vault-sync-what { font-size: 1.05em; }
+.vault-sync-path, .vault-sync-count { color: var(--text-muted); font-size: .9em; }
+.vault-sync-picked { min-height: 1.6em; font-weight: 600; }
+.vault-sync-choice .setting-item { border-top: none; }
+.vault-sync-choice .setting-item-control { justify-content: stretch; width: 100%; }
+.vault-sync-choice .setting-item-control button { flex: 1 1 0; }
+.vault-sync-notice-button { margin-left: 12px; }
+@media (max-width: 900px) { .vault-sync-compare-3 { grid-template-columns: 1fr; } }

@@ -40,9 +40,26 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
 
   async runAction(action, options = {}) {
     const result = await SyncEngine.prototype.runAction.call(this, action, options);
+    if (this.app.workspace) this.announceAttention(options.automatic);
     if (this.app.workspace && this.attention?.kind === 'conflicts' && !options.automatic && !this.reviewOpen) this.openConflictReview();
     if (this.app.workspace && this.attention?.kind === 'deletions' && !options.automatic && !this.reviewOpen) new DeletionReviewModal(this.app, this).open();
     return result;
+  }
+  // An automatic run never opens a window over your writing. It leaves one
+  // quiet notice with a button, and removes it once nothing needs you.
+  announceAttention(automatic) {
+    if (!this.attention) { this.attentionNotice?.hide(); this.attentionNotice = null; this.attentionAt = 0; return; }
+    if (!this.attentionAt) this.attentionAt = Date.now();
+    if (!automatic || this.reviewOpen || this.attentionNotice) return;
+    const count = this.attention.paths?.length || 1;
+    const notice = new Notice(`Sync is paused: ${count === 1 ? '1 file needs' : `${count} files need`} your choice. Nothing is lost.`, 0);
+    const host = notice.messageEl || notice.noticeEl;
+    const button = host?.createEl?.('button', { text: 'Choose now', cls: 'mod-cta vault-sync-notice-button' });
+    button?.addEventListener('click', event => {
+      event.stopPropagation(); notice.hide(); this.attentionNotice = null;
+      if (this.attention?.kind === 'conflicts') this.openConflictReview(); else void this.syncVault();
+    });
+    this.attentionNotice = notice;
   }
   openConflictReview() { const modal = new ConflictReviewModal(this.app, this); modal.open(); return modal; }
   openReplacementReview(fingerprint) { const modal = new IncomingReplacementModal(this.app, this, fingerprint); modal.open(); return modal; }
@@ -71,13 +88,13 @@ module.exports = class VaultGitSyncPlugin extends Plugin {
             this.report((label[this.outcome.kind] || 'Checking your vault…') + ' ' + savedTimes(this));
           }
         } catch { }
-      } else if (!this.attention && Date.now() >= retryAt && ((this.lastEdit && Date.now() - this.lastEdit >= 45000) || (failures > 0 && Date.now() >= retryAt) || Date.now() - lastRemote >= 600000)) {
+      } else if ((!this.attention || (this.lastEdit && this.lastEdit > (this.attentionAt || 0) && Date.now() - this.lastEdit >= 45000 && (this.attentionAt = Date.now()))) && Date.now() >= retryAt && ((this.lastEdit && Date.now() - this.lastEdit >= 45000) || (failures > 0 && Date.now() >= retryAt) || Date.now() - lastRemote >= 600000)) {
         const started = Date.now(); const ok = await this.runAction('sync', { automatic: true }); lastRemote = Date.now();
         if (ok && this.lastEdit <= started) this.lastEdit = 0;
         failures = ok ? 0 : failures + 1;
         retryAt = Date.now() + (failures ? [60000, 300000, 900000][Math.min(failures - 1, 2)] : 0);
       }
-      if (this.statusItem) { this.statusItem.textContent = ({ complete: 'All saved', local: 'Saved here · waiting to upload', pending: 'Edits waiting to sync', attention: 'Review needed', syncing: 'Saving…', failed: 'Sync needs attention' })[this.outcome?.kind] || 'Checking save status'; this.statusItem.setAttribute('aria-label', this.feedback + ' ' + savedTimes(this) + ' Open sync status'); this.statusItem.setAttribute('title', savedTimes(this)); }
+      if (this.statusItem) { this.statusItem.textContent = ({ complete: 'All saved', local: 'Saved here · waiting to upload', pending: 'Edits waiting to sync', attention: 'Your choice is needed', syncing: 'Saving…', failed: 'Sync needs attention' })[this.outcome?.kind] || 'Checking save status'; this.statusItem.setAttribute('aria-label', this.feedback + ' ' + savedTimes(this) + ' Open sync status'); this.statusItem.setAttribute('title', savedTimes(this)); }
     };
     this.automationTimer = setInterval(() => void poll(), 5000); void poll();
   }
@@ -410,7 +427,7 @@ class SyncEngine {
         if (losses) {
           this.attention = { kind: 'deletions', ...losses };
           this.outcome = { kind: 'attention' };
-          throw new Error(`${losses.paths.length} unexpected file changes need your review. Previous versions are protected. Nothing was uploaded.`);
+          throw new Error(losses.paths.length === 1 ? '1 file needs a quick look before it is saved. Nothing has been lost or uploaded.' : `${losses.paths.length} files need a quick look before they are saved. Nothing has been lost or uploaded.`);
         }
       }
       const branch = await git('branch', '--show-current');
@@ -800,46 +817,71 @@ function insertionOnly(before, after) {
   for (const token of tokens(after)) if (at < original.length && token === original[at]) at++;
   return at === original.length;
 }
-function missingLines(expected, current) {
-  const before = taskLines(expected), after = taskLines(current);
-  const occurrences = lines => {
+// SYNC_RULES.md rule A. Ordinary editing is never a loss: Git keeps the
+// received version, so rewording, ticking, moving or deleting a few lines saves
+// silently. Only a note that went back to its older version, or lost most of
+// its text with nothing in its place, stops for a person.
+function noteLoss(expected, previous, current) {
+  // Compare as a reader would: trailing spaces are not text, a tick is not wording.
+  const content = text => noteLines(text).map(line => line.replace(/[ \t]+$/, '')).filter(Boolean)
+    .map(line => line.replace(/^(\s*(?:[-+*]|\d+[.)])\s+\[)[^\]](\](?:\s|$))/, '$1 $2'));
+  const absent = (wanted, text) => {
     const counts = new Map();
-    for (const row of lines) if (row.key) counts.set(row.key, (counts.get(row.key) || 0) + 1);
-    return counts;
+    for (const line of text) counts.set(line, (counts.get(line) || 0) + 1);
+    return wanted.filter(line => { const n = counts.get(line) || 0; if (n) counts.set(line, n - 1); return !n; });
   };
-  const oldCounts = occurrences(before), newCounts = occurrences(after);
-  // Ambiguous repeated tasks retain strict protection; never hide a deleted copy.
-  const key = row => row.key && oldCounts.get(row.key) === 1 && newCounts.get(row.key) === 1
-    ? 'task:' + row.key : 'line:' + row.line;
-  const available = new Map();
-  for (const row of after) { const k = key(row); if (!available.has(k)) available.set(k, []); available.get(k).push(row); }
-  const missing = before.filter(row => {
-    const k = key(row);
-    if (available.get(k)?.length) { available.get(k).pop(); return false; }
-    return row.line.length > 0; // An absent final newline is not lost text.
-  });
-  const remaining = [...available.values()].flat();
-  if (missing.length * remaining.length > 4000000) return missing.map(row => row.line);
-  const identities = rows => {
-    const counts = new Map();
-    for (const row of rows) { const id = row.key || row.line; counts.set(id, (counts.get(id) || 0) + 1); }
-    return counts;
+  const received = content(expected), now = content(current);
+  if (received.length === now.length && received.every((line, i) => line === now[i])) return null;
+  if (typeof previous === 'string' && previous !== expected) {
+    const before = content(previous), contributed = absent(received, before);
+    // A stale editor buffer saved over the note has this exact shape:
+    // everything the older version had is still here and everything the other
+    // device added is gone. Ticks and new typing on top do not hide it.
+    // A contributed line that was reworded here is an edit, not a dropped line.
+    const words = line => new Set(line.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
+    const similar = (a, b) => { const x = words(a), y = words(b); let shared = 0; for (const w of x) if (y.has(w)) shared++; return shared * 2 >= x.size + y.size - shared && shared > 0; };
+    const fresh = absent(absent(now, before), received);
+    const gone = absent(contributed, now).filter(line => !fresh.some(candidate => similar(line, candidate)));
+    if (contributed.length && gone.length === contributed.length && !absent(before, now).length) {
+      return { reason: 'This note went back to an older version', removed: contributed };
+    }
+  }
+  if (received.length - now.length >= 10 && now.length * 2 <= received.length) return { reason: 'Most of this note was removed', removed: absent(received, now) };
+  return null;
+}
+const trimEnd = line => line.replace(/[ \t\r]+$/, '');
+const sameText = (a, b) => a.length === b.length && a.every((line, i) => trimEnd(line) === trimEnd(b[i]));
+// True when every line of `small` appears in `large`, in order.
+function containsLines(large, small) {
+  let at = 0;
+  for (const line of large) if (at < small.length && trimEnd(line) === trimEnd(small[at])) at++;
+  return at === small.length;
+}
+// SYNC_RULES.md rule B for Obsidian settings: combine key by key. Two different
+// values for one key keep the newer save; settings never interrupt the user.
+function mergeSettings(baseText, localText, serverText, serverIsNewer) {
+  let local, server, base;
+  try { local = JSON.parse(localText); server = JSON.parse(serverText); } catch { return null; }
+  try { base = baseText === null || baseText === undefined ? undefined : JSON.parse(baseText); } catch { base = undefined; }
+  const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const plain = value => value && typeof value === 'object' && !Array.isArray(value);
+  const combine = (b, l, r) => {
+    if (equal(l, r) || equal(r, b)) return l;
+    if (equal(l, b)) return r;
+    if (!plain(l) || !plain(r)) return serverIsNewer ? r : l;
+    const origin = plain(b) ? b : {}; const out = {};
+    for (const key of [...new Set([...Object.keys(l), ...Object.keys(r)])]) {
+      const inL = Object.prototype.hasOwnProperty.call(l, key), inR = Object.prototype.hasOwnProperty.call(r, key);
+      const inB = Object.prototype.hasOwnProperty.call(origin, key);
+      if (inL && inR) out[key] = combine(origin[key], l[key], r[key]);
+      // A key one side removed and the other left alone stays removed.
+      else if (inL) { if (!inB || !equal(l[key], origin[key])) out[key] = l[key]; }
+      else if (!inB || !equal(r[key], origin[key])) out[key] = r[key];
+    }
+    return out;
   };
-  const oldIdentities = identities(before), newIdentities = identities(after);
-  const candidates = missing.map(row => {
-    if (oldIdentities.get(row.key || row.line) !== 1) return [];
-    return remaining.filter(candidate => {
-      if (newIdentities.get(candidate.key || candidate.line) !== 1 || !!row.task !== !!candidate.task) return false;
-      if (row.task) return insertionOnly(row.section, candidate.section) && row.task[1] === candidate.task[1] && row.task[3] === candidate.task[3]
-        && insertionOnly(row.task[4], candidate.task[4]);
-      return insertionOnly(row.line, candidate.line);
-    });
-  });
-  // Each added-to line must match exactly one old line, in both directions.
-  // Never use one surviving passage to excuse removal of a second copy.
-  const uses = new Map();
-  for (const list of candidates) for (const row of list) uses.set(row, (uses.get(row) || 0) + 1);
-  return missing.filter((row, i) => candidates[i].length !== 1 || uses.get(candidates[i][0]) !== 1).map(row => row.line);
+  const indent = /^\{\r?\n(\s+)"/.exec(localText)?.[1] ?? 2;
+  return JSON.stringify(combine(base, local, server), null, indent) + (localText.endsWith('\n') ? '\n' : '');
 }
 function recoveryBlocks(current, historical) {
   const a = noteLines(current), b = noteLines(historical);
@@ -861,8 +903,9 @@ function recoveryBlocks(current, historical) {
 }
 function renderRecovery(blocks, selected) { return blocks.flatMap(b => selected.has(b.id) ? b.historical : b.current).join('\n'); }
 
-// Bounded diff3: independent edits are retained; overlapping edits are compared
-// to their common ancestor, never resolved by time or a "checked wins" rule.
+// Bounded diff3 following SYNC_RULES.md rule B: independent edits are retained
+// and overlapping edits are compared to their common ancestor. Only a real
+// clash of wording is left as a conflict.
 function mergeNote(base, local, server) {
   const scalar = (b, l, r, normalize = x => x) => {
     if (normalize(l) === normalize(r) || normalize(r) === normalize(b)) return l;
@@ -926,10 +969,20 @@ function mergeNote(base, local, server) {
         // At least one side retains the original label and list structure.
         if (l.key !== row.key && r.key !== row.key) return null;
         const parts = [1, 2, 3, 4].map(n => scalar(row.task[n], l.task[n], r.task[n], n === 2 ? x => x === 'X' ? 'x' : x : x => x));
+        // Both devices changed the state differently: a finished task stays finished.
+        if (parts[1] === null) parts[1] = /^x$/i.test(l.task[2]) ? l.task[2] : /^x$/i.test(r.task[2]) ? r.task[2] : null;
         return parts.includes(null) ? null : parts.join('');
       });
       if (!combined.includes(null)) result = combined;
     }
+    // Line endings and trailing spaces are not edits.
+    if (result === null) {
+      if (sameText(left, right) || sameText(right, original)) result = left;
+      else if (sameText(left, original)) result = right;
+    }
+    // Both devices added different lines at the same place: keep everything,
+    // the other device's lines first.
+    if (result === null && !original.length) result = containsLines(left, right) ? left : containsLines(right, left) ? right : [...right, ...left];
     add({ base: original, local: left, server: right, result, conflict: result === null });
     cursor = end;
   }
@@ -1021,6 +1074,18 @@ class SyncSafety {
     const total = (await this.gitBytes('ls-files', '-z')).toString().split('\0').filter(Boolean).length;
     const paths = new Set(deleted.length >= 20 || (deleted.length >= 5 && deleted.length / Math.max(total, 1) >= .2) ? deleted : []);
     const details = [];
+    // Protection covers a received file only until this computer saves its own
+    // version of it. After that both versions are in history, and keeping the
+    // record would only turn later edits into questions.
+    if (!this.data.approval && this.data.incoming?.length) {
+      const saved = new Map();
+      for (const row of (await this.gitBytes('ls-tree', '-r', '-z', 'HEAD')).toString().split('\0')) {
+        const match = /^\d+ blob ([a-f0-9]+)\t([\s\S]+)$/.exec(row);
+        if (match) saved.set(match[2], match[1]);
+      }
+      const kept = this.data.incoming.filter(entry => saved.get(entry.path) === entry.expected);
+      if (kept.length !== this.data.incoming.length) { this.data.incoming = kept; await this.save(); }
+    }
     for (const entry of this.data.incoming || []) {
       const file = await this.safePath(entry.path);
       const indexOID = await this.optional('rev-parse', `:${entry.path}`);
@@ -1029,24 +1094,23 @@ class SyncSafety {
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       let missing = !bytes || !indexOID;
       let lost = [];
-      let reason = missing ? 'Protected file removed' : '';
+      let reason = missing ? 'This file was deleted' : '';
       if (bytes && indexOID === entry.expected && await this.git('hash-object', '--path', entry.path, '--', file) === entry.expected) continue;
       if (/\.md$/i.test(entry.path)) {
-        const protectedBytes = await this.gitBytes('cat-file', 'blob', entry.expected);
-        try {
-          const expected = decodeNote(protectedBytes);
-          for (const candidate of [bytes, indexOID ? await this.gitBytes('cat-file', 'blob', indexOID) : null]) {
-            const loss = missingLines(expected, candidate ? decodeNote(candidate) : '');
-            const counts = new Map();
-            for (const line of lost) counts.set(line, (counts.get(line) || 0) + 1);
-            const seen = new Map();
-            for (const line of loss) { const n = (seen.get(line) || 0) + 1; seen.set(line, n); if (n > (counts.get(line) || 0)) lost.push(line); }
+        // A removed note keeps its reason; an edited note is judged by the
+        // shape of the edit, never by the fact of it.
+        if (!missing) try {
+          const expected = decodeNote(await this.gitBytes('cat-file', 'blob', entry.expected));
+          const previous = entry.previous ? decodeNote(await this.gitBytes('cat-file', 'blob', entry.previous)) : null;
+          for (const candidate of [bytes, await this.gitBytes('cat-file', 'blob', indexOID)]) {
+            const loss = noteLoss(expected, previous, decodeNote(candidate));
+            if (loss) { reason = loss.reason; lost = loss.removed; break; }
           }
-          if (lost.length) reason = 'Protected text removed or replaced';
-        } catch { reason = 'Protected Markdown could not be assessed'; }
-      } else if (bytes && entry.previous && entry.previous !== entry.expected) {
+        } catch { reason = 'This note could not be read safely'; }
+      } else if (bytes && !entry.path.startsWith('.obsidian/') && entry.previous && entry.previous !== entry.expected) {
+        // Settings files are rewritten by Obsidian constantly; the newer value wins.
         const oid = await this.git('hash-object', '--path', entry.path, '--', file);
-        if (oid === entry.previous || indexOID === entry.previous) reason = 'Protected file reverted';
+        if (oid === entry.previous || indexOID === entry.previous) reason = 'This file went back to an older version';
       }
       if (reason) { paths.add(entry.path); details.push({ path: entry.path, reason, removed: lost }); }
     }
@@ -1096,8 +1160,9 @@ class SyncSafety {
       if (await this.optional('rev-parse', `HEAD:${version.path}`) !== version.oid) return;
     }
     const paths = new Set(approval.versions.map(x => x.path));
+    // The approved version is this computer's own work now; it is not
+    // protected again, so the next edit never asks twice.
     this.data.incoming = (this.data.incoming || []).filter(x => !paths.has(x.path));
-    for (const version of approval.versions) if (version.oid) this.data.incoming.push({ path: version.path, expected: version.oid, previous: null });
     this.data.approval = null; this.data.approved = null; await this.save();
   }
   async fingerprint(name) {
@@ -1244,9 +1309,7 @@ class SyncSafety {
     await this.fs.mkdir(this.path.dirname(file), { recursive: true });
     await this.fs.writeFile(file, options.content);
     await this.git('add', '--', options.path);
-    const expected = await this.git('hash-object', '-w', '--path', options.path, '--', file);
     this.data.incoming = (this.data.incoming || []).filter(entry => entry.path !== options.path);
-    this.data.incoming.push({ path: options.path, expected, previous: null });
     this.data.approved = null; this.data.approval = null; await this.save();
   }
   async combineConflicts(error) {
@@ -1255,8 +1318,12 @@ class SyncSafety {
     for (const entry of entries) if (entry.merge?.clean) {
       await this.resolve({ path: entry.path, choice: 'merged', fingerprint: entry.fingerprint });
     }
-    const remaining = await this.conflicts();
+    let remaining = await this.conflicts();
     if (remaining.length) {
+      // Never leave Git's conflict markers in a note. Until a choice is made
+      // the note shows this computer's text; both versions stay in the index.
+      for (const entry of remaining) if (entry.sides['2'] && !entry.sides['2'].binary) await this.git('checkout', '--ours', '--', entry.path);
+      remaining = await this.conflicts();
       this.onConflicts?.(remaining);
       throw new Error(`${remaining.length} files need your choice. Both versions are protected.`);
     }
@@ -1288,10 +1355,21 @@ class SyncSafety {
       if (/\.md$/i.test(entry.path) && ['2', '3'].every(stage => entry.sides[stage] && !entry.sides[stage].binary) &&
         Object.values(entry.sides).every(side => side.mode === '100644' || side.mode === '100755')) {
         try {
+          const local = noteLines(entry.sides['2'].text), server = noteLines(entry.sides['3'].text);
+          // Both devices created this note. Identical, or one holding all of
+          // the other, needs no choice.
+          const fuller = containsLines(local, server) ? local : containsLines(server, local) ? server : null;
           entry.merge = entry.sides['1'] && !entry.sides['1'].binary
             ? mergeNote(entry.sides['1'].text, entry.sides['2'].text, entry.sides['3'].text)
-            : { clean: false, blocks: [{ id: 0, conflict: true, base: [], local: noteLines(entry.sides['2'].text), server: noteLines(entry.sides['3'].text) }] };
+            : fuller ? { clean: true, blocks: [{ id: 0, conflict: false, result: fuller }] }
+            : { clean: false, blocks: [{ id: 0, conflict: true, base: [], local, server }] };
         } catch { entry.mergeUnavailable = 'This comparison is too large. Compare the full copies and combine them manually.'; }
+      } else if (/^\.obsidian\/.*\.json$/i.test(entry.path) && ['2', '3'].every(stage => entry.sides[stage] && !entry.sides[stage].binary) &&
+        Object.values(entry.sides).every(side => side.mode === '100644' || side.mode === '100755')) {
+        const time = async ref => Number(await this.optional('log', '-1', '--format=%ct', ref)) || 0;
+        const combined = mergeSettings(entry.sides['1']?.binary ? null : entry.sides['1']?.text, entry.sides['2'].text, entry.sides['3'].text,
+          await time('MERGE_HEAD') >= await time('HEAD'));
+        if (combined !== null) entry.merge = { clean: true, blocks: [{ id: 0, conflict: false, result: combined.split('\n') }] };
       }
       result.push(entry);
     }
@@ -1330,91 +1408,110 @@ class SyncSafety {
   }
 }
 
+// Shows `text` with the words that differ from `before` marked, so the eye
+// lands on what changed instead of re-reading the whole passage.
+function showWords(container, before, text) {
+  const pre = container.createEl('pre', { cls: 'vault-sync-recovery-text' });
+  if (!text) { pre.createEl('span', { cls: 'vault-sync-empty', text: '(nothing here)' }); return pre; }
+  const tokens = value => value.match(/[\p{L}\p{N}\p{M}]+|\s+|[^\p{L}\p{N}\p{M}\s]/gu) || [];
+  const a = tokens(before || ''), b = tokens(text);
+  if (before === null || before === undefined || a.length * b.length > 250000) { pre.createEl('span', { text }); return pre; }
+  const table = Array.from({ length: a.length + 1 }, () => new Uint16Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) table[i][j] = a[i] === b[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+  let i = 0, j = 0, run = '', changed = false;
+  const flush = () => { if (run) pre.createEl(changed ? 'mark' : 'span', { text: run }); run = ''; };
+  const push = (token, isChanged) => { if (isChanged !== changed) { flush(); changed = isChanged; } run += token; };
+  while (j < b.length) {
+    if (i < a.length && a[i] === b[j]) { push(b[j], false); i++; j++; }
+    else if (i < a.length && table[i + 1][j] >= table[i][j + 1]) i++;
+    else { push(b[j], !/^\s+$/.test(b[j]) || changed); j++; }
+  }
+  flush();
+  return pre;
+}
+
+// One conflict, one card, one tap. Safe combinations never reach this screen
+// (SYNC_RULES.md); what is left is a real choice between two wordings.
 class ConflictReviewModal extends Modal {
   constructor(app, plugin) { super(app); this.plugin = plugin; }
-  onOpen() { this.plugin.reviewOpen = true; this.setTitle('Review your files'); void this.render(); }
+  onOpen() { this.plugin.reviewOpen = true; this.setTitle('Your choice is needed'); void this.render(); }
   onClose() { this.closed = true; this.plugin.reviewOpen = false; }
   async render() {
     const ok = await this.plugin.runAction('review');
     if (this.closed) return;
-    const root = this.contentEl; root.empty();
+    const root = this.contentEl; root.empty(); root.addClass('vault-sync-clear-review');
     if (!ok) { root.createEl('p', { text: this.plugin.feedback }); return; }
     const entries = this.plugin.review || [];
-    root.createEl('p', { text: 'Both originals are protected. Choose what you want to keep; nothing uploads until you finish.' });
     if (!entries.length) {
-      root.createEl('p', { text: 'Your choices are saved. Finish syncing to make them available on your other devices.' });
-      new Setting(root).addButton(b => b.setButtonText('Save and finish syncing').setCta().onClick(async () => { this.close(); await this.plugin.syncVault(); }));
+      // The last choice finishes the job; there is no extra confirm step.
+      root.createEl('p', { text: 'All set. Saving and uploading now…', attr: { role: 'status' } });
+      this.close(); await this.plugin.syncVault();
       return;
     }
-    root.createEl('p', { text: `${entries.length} files need your choice` });
-    for (const entry of entries) {
-      const card = root.createDiv({ cls: 'vault-git-sync-review' });
-      card.createEl('h3', { text: entry.path.startsWith('.obsidian/') ? 'Obsidian settings' : entry.path.split('/').pop() });
-      card.createEl('p', { text: entry.path });
-      if (entry.path.startsWith('.obsidian/')) card.createEl('p', { text: 'Choose the settings you want active. The server is not necessarily newer. Both originals remain available in protected history.' });
-      if (entry.path.startsWith('.obsidian/')) {
-        try {
-          const phone = JSON.parse(entry.sides['2']?.text), server = JSON.parse(entry.sides['3']?.text);
-          const keys = [...new Set([...Object.keys(phone), ...Object.keys(server)])].sort().filter(key => JSON.stringify(phone[key]) !== JSON.stringify(server[key]));
-          if (keys.length) {
-            card.createEl('h4', { text: 'Settings that differ' });
-            for (const key of keys) card.createEl('pre', { cls: 'vault-sync-recovery-text', text: `${key}\nThis computer: ${JSON.stringify(phone[key]) ?? 'Not set'}\nServer: ${JSON.stringify(server[key]) ?? 'Not set'}` });
-          }
-        } catch { /* Full text previews below remain available. */ }
-      }
-      const pretty = side => {
-        if (!side) return 'Deleted on this side';
-        if (side.binary) return 'Attachment — choose a copy to keep.';
-        try { return JSON.stringify(JSON.parse(side.text), null, 2); } catch { return side.text; }
-      };
-      for (const [stage, title] of [['1', 'Common ancestor'], ['2', 'This computer'], ['3', 'Server']]) {
-        const section = card.createEl('details'); section.createEl('summary', { text: title });
-        section.createEl('pre', { cls: 'vault-sync-recovery-text', text: pretty(entry.sides[stage]) });
-      }
-      const choose = async (choice, content, choices) => {
-        const ok = await this.plugin.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice, content, choices });
-        if (ok) await this.render(); else new Notice(this.plugin.feedback, 15000);
-      };
-      new Setting(card).addButton(b => b.setButtonText(entry.sides['2'] ? 'Use this computer’s version' : 'Keep this deletion').onClick(() => choose('phone')))
-        .addButton(b => b.setButtonText(entry.sides['3'] ? 'Use server version' : 'Use server deletion').onClick(() => choose('server')));
-      if (entry.sides['2'] && entry.sides['3'] && !entry.path.startsWith('.obsidian/')) new Setting(card).addButton(b => b.setButtonText('Keep both copies').onClick(() => choose('both')));
-      if (entry.merge) {
-        const editor = card.createDiv(); editor.createEl('h4', { text: 'Combine edits' });
-        editor.createEl('p', { text: 'Independent changes are already combined. Choose each conflicting section, then edit the final preview if needed. Changing a section choice rebuilds the preview.' });
-        const choices = {};
-        const unresolved = entry.merge.blocks.filter(block => block.conflict);
-        const progress = editor.createEl('p', { attr: { role: 'status', 'aria-live': 'polite' } });
-        let input, save;
-        const update = () => {
-          const remaining = unresolved.filter(block => !choices[block.id]).length;
-          progress.textContent = remaining ? `${remaining} sections need a choice. Draft shows computer text for those sections.` : 'All sections resolved. Review and edit the full result before saving.';
-          const previewChoices = Object.fromEntries(unresolved.map(block => [block.id, choices[block.id] || 'local']));
-          input.value = renderMerge(entry.merge, previewChoices); input.disabled = remaining > 0;
-          save.setDisabled(remaining > 0);
-        };
-        for (const block of unresolved) {
-          const section = editor.createDiv({ cls: 'vault-git-sync-review' });
-          section.createEl('h5', { text: `Conflicting section ${block.id + 1}` });
-          const selected = section.createEl('p', { text: 'No choice yet' });
-          for (const [side, title] of [['base', 'Common ancestor'], ['local', 'This computer'], ['server', 'Server']]) {
-            section.createEl('h6', { text: title }); section.createEl('pre', { text: block[side].join('\n') || '(No text)' });
-          }
-          const settings = new Setting(section);
-          for (const [side, label] of [['local', 'Keep computer section'], ['server', 'Keep server section'], ['base', 'Keep original section'], ['both', 'Keep both sections']]) {
-            settings.addButton(b => b.setButtonText(label).onClick(() => { choices[block.id] = side; selected.textContent = label; update(); }));
-          }
+    const entry = entries[0];
+    const settings = entry.path.startsWith('.obsidian/');
+    const name = settings ? 'Obsidian settings' : entry.path.split('/').pop().replace(/\.md$/i, '');
+    root.createEl('p', { cls: 'vault-sync-count', text: entries.length === 1 ? 'Nothing is lost. Both versions are saved.' : `Nothing is lost. Both versions are saved. ${entries.length} files need a choice; this is the first.` });
+    const card = root.createDiv({ cls: 'vault-git-sync-review' });
+    card.createEl('h3', { text: name });
+    card.createEl('p', { cls: 'vault-sync-path', text: entry.path });
+    const choose = async (choice, content, choices) => {
+      if (this.busy) return; this.busy = true;
+      const done = await this.plugin.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice, content, choices });
+      this.busy = false;
+      if (done) await this.render(); else new Notice(this.plugin.feedback, 15000);
+    };
+    const unresolved = entry.merge ? entry.merge.blocks.filter(block => block.conflict) : [];
+    if (unresolved.length) {
+      card.createEl('p', { cls: 'vault-sync-what', text: unresolved.length === 1
+        ? 'This computer and your other device both changed the same lines. Everything else in the note is already combined.'
+        : `This computer and your other device both changed the same lines in ${unresolved.length} places. Everything else in the note is already combined.` });
+      const choices = {};
+      unresolved.forEach((block, index) => {
+        const section = card.createDiv({ cls: 'vault-sync-choice' });
+        if (unresolved.length > 1) section.createEl('h4', { text: `Place ${index + 1} of ${unresolved.length}` });
+        const before = block.base.length ? block.base.join('\n') : null;
+        const grid = section.createDiv({ cls: 'vault-sync-compare vault-sync-compare-3' });
+        for (const [side, title] of [['base', 'Before'], ['local', 'This computer'], ['server', 'Other device']]) {
+          const pane = grid.createDiv({ cls: `vault-sync-pane vault-sync-pane-${side}` }); pane.createEl('h4', { text: title });
+          showWords(pane, side === 'base' ? null : before, block[side].join('\n'));
         }
-        editor.createEl('h5', { text: 'Merged result' });
-        input = editor.createEl('textarea', { cls: 'vault-git-sync-result', attr: { 'aria-label': 'Merged result' } });
-        new Setting(editor).addButton(b => { save = b; b.setButtonText('Save merged result').setCta().onClick(() => choose('merged', input.value, choices)); });
-        update();
-      } else if (!entry.sides['2']?.binary && !entry.sides['3']?.binary) {
-        const editor = card.createEl('details'); editor.createEl('summary', { text: 'Combine edits' });
-        editor.createEl('p', { text: entry.mergeUnavailable || 'This file needs manual combination. Compare the versions above; the editor starts with this computer’s text.' });
-        const input = editor.createEl('textarea', { cls: 'vault-git-sync-result' }); input.value = entry.sides['2']?.text || '';
-        new Setting(editor).setDesc('Review the full result before saving.').addButton(b => b.setButtonText('Save this result').onClick(() => choose('edited', input.value)));
+        const picked = section.createEl('p', { cls: 'vault-sync-picked', text: '', attr: { role: 'status', 'aria-live': 'polite' } });
+        const row = new Setting(section);
+        for (const [side, label] of [['local', 'Keep this computer’s'], ['server', 'Keep other device’s'], ['both', 'Keep both']]) {
+          row.addButton(b => b.setButtonText(label).onClick(async () => {
+            choices[block.id] = side; picked.textContent = `Chosen: ${label}`;
+            if (unresolved.every(item => choices[item.id])) await choose('merged', undefined, choices);
+          }));
+        }
+      });
+    } else {
+      const local = entry.sides['2'], server = entry.sides['3'];
+      card.createEl('p', { cls: 'vault-sync-what', text: !local ? 'You deleted this file on this computer. Your other device edited it.'
+        : !server ? 'Your other device deleted this file. You edited it on this computer.'
+        : local.binary || server.binary ? 'This attachment changed on both this computer and your other device.'
+        : 'This file changed on both this computer and your other device, and the two versions cannot be combined line by line.' });
+      if (local && server && !local.binary && !server.binary) {
+        const read = card.createEl('details'); read.createEl('summary', { text: 'Read both versions' });
+        const grid = read.createDiv({ cls: 'vault-sync-compare' });
+        for (const [side, title, other] of [[local, 'This computer', server], [server, 'Other device', local]]) {
+          const pane = grid.createDiv({ cls: 'vault-sync-pane' }); pane.createEl('h4', { text: title }); showWords(pane, other.text, side.text);
+        }
       }
+      const row = new Setting(card);
+      row.addButton(b => b.setButtonText(local ? 'Keep this computer’s' : 'Keep it deleted').onClick(() => choose('phone')));
+      row.addButton(b => b.setButtonText(server ? 'Keep other device’s' : 'Delete it here too').onClick(() => choose('server')));
+      if (local && server && !settings) row.addButton(b => b.setButtonText('Keep both').onClick(() => choose('both')));
+      if (local && server && !settings) card.createEl('p', { cls: 'vault-sync-path', text: 'Keep both saves the other device’s version beside this one as a second file.' });
     }
+    if (!entry.sides['2']?.binary && !entry.sides['3']?.binary && (entry.sides['2'] || entry.sides['3'])) {
+      const editor = card.createEl('details'); editor.createEl('summary', { text: 'Write the result myself' });
+      const input = editor.createEl('textarea', { cls: 'vault-git-sync-result', attr: { 'aria-label': 'Result to save' } });
+      input.value = unresolved.length ? renderMerge(entry.merge, Object.fromEntries(unresolved.map(block => [block.id, 'local']))) : (entry.sides['2']?.text ?? entry.sides['3']?.text ?? '');
+      new Setting(editor).setDesc('Starts from this computer’s version. What you see here is exactly what is saved.')
+        .addButton(b => b.setButtonText('Save what I wrote').onClick(() => choose('edited', input.value)));
+    }
+    new Setting(root).addButton(b => b.setButtonText('Decide later — nothing changes').onClick(() => this.close()));
   }
 }
 
@@ -1425,7 +1522,7 @@ function showChangedPassage(container, current, saved) {
   while (suffix < current.length - prefix && suffix < saved.length - prefix && current[current.length - 1 - suffix] === saved[saved.length - 1 - suffix]) suffix++;
   if (current.length > saved.length && prefix + suffix === saved.length) container.createEl('p', { text: 'Your current version adds text here. The saved wording is still present.' });
   const grid = container.createDiv({ cls: 'vault-sync-compare' });
-  for (const [text, title, kind] of [[saved, 'Saved copy · before this edit', 'saved'], [current, 'Your current note · on this computer', 'current']]) {
+  for (const [text, title, kind] of [[saved, 'From your other device', 'saved'], [current, 'On this computer now', 'current']]) {
     const pane = grid.createDiv(); pane.createEl('h4', { text: title });
     const pre = pane.createEl('pre', { cls: 'vault-sync-recovery-text' });
     if (!text) { pre.createEl('span', { text: '(No text in this version)' }); continue; }
@@ -1444,7 +1541,7 @@ function renderProtectedMerge(blocks, choices = {}) {
 }
 class DeletionReviewModal extends Modal {
   constructor(app, plugin) { super(app); this.plugin = plugin; this.losses = plugin.attention; }
-  onOpen() { this.plugin.reviewOpen = true; this.setTitle('Review before syncing'); void this.render(); }
+  onOpen() { this.plugin.reviewOpen = true; this.setTitle('Check this before it is saved'); void this.render(); }
   onClose() { this.closed = true; this.plugin.reviewOpen = false; }
   async render() {
     const root = this.contentEl; root.empty(); root.addClass('vault-sync-clear-review');
@@ -1458,9 +1555,9 @@ class DeletionReviewModal extends Modal {
       return;
     }
     const files = this.plugin.replacementPreview.files;
-    root.createEl('h3', { text: 'Your changes are paused. Nothing has been replaced.' });
-    root.createEl('p', { text: 'A note changed after it arrived from another device. This can be an ordinary edit. Compare the saved copy with your current note below.' });
-    root.createEl('p', { text: `${files.length} ${files.length === 1 ? 'file needs' : 'files need'} review. Highlighted text is different. Both copies stay available in recovery history.` });
+    root.createEl('h3', { text: 'Nothing is lost. Saving is paused until you choose.' });
+    root.createEl('p', { text: files.length === 1 ? 'This file looks like an older version came back, or most of it was removed. If you meant that, keep it. If not, bring back the version from your other device.' : `${files.length} files look like older versions came back, or lost most of their text. If you meant that, keep them. If not, bring back the versions from your other device.` });
+    for (const detail of this.losses.details || []) if (detail.reason) root.createEl('p', { cls: 'vault-sync-what', text: `${detail.path.split('/').pop()}: ${detail.reason}.` });
     for (const file of files) {
       const card = root.createDiv({ cls: 'vault-git-sync-review' });
       card.createEl('h3', { text: file.path.split('/').pop() });
@@ -1480,17 +1577,14 @@ class DeletionReviewModal extends Modal {
       } else card.createEl('p', { text: `A text comparison is unavailable for this file. Saved copy: ${file.replacementBytes} bytes. Current copy: ${file.currentBytes} bytes. Close this review to inspect it in its own app before choosing.` });
     }
     const deleted = files.some(file => file.deleted);
-    root.createEl('h3', { text: 'Keep your current version?' });
-    root.createEl('p', { text: deleted ? 'This saves the current files and deletions, then syncs them to your other devices. It does not restore the saved copies.' : 'This keeps the current text shown above, including your latest edits. It saves and syncs your vault to your other devices.' });
-    new Setting(root).addButton(b => b.setButtonText(deleted ? 'Keep current files and deletions, then sync' : files.length === 1 ? 'Keep my current note and sync' : 'Keep all current versions and sync').setCta().onClick(async () => {
+            new Setting(root).addButton(b => b.setButtonText('Keep what’s on this computer').setCta().onClick(async () => {
       if (this.busy) return; this.busy = true; b.setDisabled(true);
       const saved = await this.plugin.runAction('approve-deletions', { fingerprint: this.losses.fingerprint });
       if (saved) { this.close(); await this.plugin.syncVault(); }
       else { this.busy = false; b.setDisabled(false); new Notice(this.plugin.feedback, 15000); }
-    })).addButton(b => b.setButtonText('Decide later — change nothing').onClick(() => this.close()));
-    const restore = root.createEl('details'); restore.createEl('summary', { text: 'Restore older copies instead…' });
-    restore.createEl('p', { text: 'This can remove your latest edits. You will see a separate replacement preview before anything changes.' });
-    new Setting(restore).addButton(b => b.setButtonText('Preview replacing current files').onClick(() => { this.close(); this.plugin.openReplacementReview(this.losses.fingerprint); }));
+    })).addButton(b => b.setButtonText('Bring back the other device’s version…').onClick(() => { this.close(); this.plugin.openReplacementReview(this.losses.fingerprint); }))
+      .addButton(b => b.setButtonText('Decide later — nothing changes').onClick(() => this.close()));
+    root.createEl('p', { cls: 'vault-sync-path', text: deleted ? 'Keeping saves the current files and deletions and syncs them. Bringing back shows a preview first.' : 'Keeping saves the text on this computer and syncs it. Bringing back shows a preview first.' });
   }
 }
 class ProtectedMergeModal extends Modal {
@@ -1706,7 +1800,8 @@ if (HEADLESS) {
 
 module.exports.recoveryBlocks = recoveryBlocks;
 module.exports.renderRecovery = renderRecovery;
-module.exports.missingLines = missingLines;
+module.exports.noteLoss = noteLoss;
+module.exports.mergeSettings = mergeSettings;
 module.exports.mergeNote = mergeNote;
 module.exports.renderMerge = renderMerge;
 

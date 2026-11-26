@@ -8,38 +8,89 @@ const vm = require('node:vm');
 const cp = require('node:child_process');
 const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
-test('task protection permits state edits but retains text, duplicates and fenced examples', () => {
+test('rule A: ordinary edits to a received note never ask; going back to the older version does', () => {
   const { api } = load();
-  const original = '# Core\n- [ ] 🧘 practice\n\t- [x] child\n1. [ ] numbered\n';
-  const edited = '# Core\n- [x] 🧘 practice\n\t- [ ] child\n1. [-] numbered\n';
-  assert.equal(api.missingLines(original, edited).length, 0);
-  assert.equal(api.missingLines(edited, original).length, 0);
-  assert.equal(api.missingLines(original, edited.replace('practice', 'something else')).length, 1);
-  assert.equal(api.missingLines('- [ ] same\n- [ ] same', '- [x] same').length, 2);
-  for (const fence of ['```', '~~~~']) {
-    assert.equal(api.missingLines(`${fence}\n- [ ] example\n${fence}`, `${fence}\n- [x] example\n${fence}`).length, 1);
+  const received = '# Routines\n- [ ] 🫁 CPAP previous night?\n- [ ] Compliant?\n';
+  // The exact edit that stopped the phone: reword and tick one line, tick the next.
+  assert.equal(api.noteLoss(received, null, '# Routines\n- [x] 🫁 No CPAP previous night?\n- [x] Compliant?\n'), null);
+  const older = 'heading\ncontext\n- [ ] shower\n', newer = 'heading\nFinished at 12:00\ncontext\n- [ ] shower\n';
+  for (const current of [
+    'heading\nFinished at 12:30\ncontext\n- [x] shower\n',   // reworded the arriving line
+    'heading\nFinished at 12:00\n- [ ] shower\n',            // deleted a different line
+    'context\nheading\nFinished at 12:00\n- [x] shower  \n', // moved, ticked, trailing spaces
+    newer.replace(/\n/g, '\r\n'),
+  ]) assert.equal(api.noteLoss(newer, older, current), null, JSON.stringify(current));
+  for (const current of [
+    older,                                          // exact older version
+    'heading\ncontext\n- [x] shower\n',             // older version with a tick
+    'heading\ncontext\n- [x] shower\nnew typing\n', // older version with new typing
+  ]) {
+    const loss = api.noteLoss(newer, older, current);
+    assert.match(loss.reason, /older version/); assert.equal(JSON.stringify(loss.removed), JSON.stringify(['Finished at 12:00']));
   }
+  // A received tick that is unticked here is a state change, not lost text.
+  assert.equal(api.noteLoss('- [x] task\n', '- [ ] task\n', '- [ ] task\n'), null);
+  const long = Array.from({ length: 24 }, (_, i) => `line ${i}`).join('\n');
+  assert.match(api.noteLoss(long, null, 'line 0\nline 1\n').reason, /Most of this note/);
+  assert.equal(api.noteLoss(long, null, long.replace(/line/g, 'entry')), null);
 });
 
-test('merge UI displays safe combined edits and enables saving only after conflict choices', async () => {
+test('rule B: safe combinations need no choice', () => {
+  const { api } = load();
+  for (const [base, local, server, expected] of [
+    ['- [ ] task\n', '- [x] task\n', '- [-] task\n', '- [x] task\n'],
+    ['log\n', 'log\nphone line\n', 'log\nserver line\n', 'log\nserver line\nphone line\n'],
+    ['a\nb\n', 'a  \nB\n', 'a\nb\n', 'a  \nB\n'],
+    ['one\ntwo\n', 'ONE\ntwo\n', 'one\nTWO\n', 'ONE\nTWO\n'],
+    ['- [ ] 🫁 CPAP?\n- [ ] ok\n', '- [x] 🫁 No CPAP?\n- [x] ok\n', '- [ ] 🫁 CPAP?\n- [x] ok\n', '- [x] 🫁 No CPAP?\n- [x] ok\n'],
+  ]) {
+    const merge = api.mergeNote(base, local, server);
+    assert.equal(merge.clean, true, JSON.stringify({ base, local, server }));
+    assert.equal(api.renderMerge(merge), expected);
+  }
+  assert.equal(api.mergeNote('old wording\n', 'phone wording\n', 'server wording\n').clean, false);
+});
+
+test('rule B: settings combine key by key and a same-key clash keeps the newer save', () => {
+  const { api } = load();
+  const base = '{\n  "a": 1,\n  "b": { "x": 1, "y": 1 },\n  "gone": true\n}\n';
+  const local = '{\n  "a": 2,\n  "b": { "x": 5, "y": 1 },\n  "gone": true,\n  "phone": 1\n}\n';
+  const server = '{\n  "a": 3,\n  "b": { "x": 1, "y": 9 },\n  "server": 1\n}\n';
+  assert.equal(JSON.stringify(JSON.parse(api.mergeSettings(base, local, server, true))), JSON.stringify({ a: 3, b: { x: 5, y: 9 }, phone: 1, server: 1 }));
+  assert.equal(JSON.stringify(JSON.parse(api.mergeSettings(base, local, server, false))), JSON.stringify({ a: 2, b: { x: 5, y: 9 }, phone: 1, server: 1 }));
+  assert.ok(api.mergeSettings(base, local, server, true).endsWith('}\n'));
+  assert.equal(api.mergeSettings(base, '{ broken', server, true), null);
+});
+
+test('conflict card: one tap on the last choice saves the note and finishes syncing', async () => {
   const { api, ui, buttons } = load();
   const base = 'top\ncontext\nold\ncontext two\nend\n';
   const local = 'LOCAL\ncontext\nleft\ncontext two\nend\n';
   const server = 'top\ncontext\nright\ncontext two\nSERVER\n';
-  const entry = { path: 'demo.md', fingerprint: 'reviewed', sides: { '1': { text: base }, '2': { text: local }, '3': { text: server } }, merge: api.mergeNote(base, local, server) };
-  let resolved;
-  const plugin = { review: [entry], async runAction(action, options) { if (action === 'resolve') { resolved = options; this.review = []; } return true; } };
+  const entry = { path: 'notes/demo.md', fingerprint: 'reviewed', sides: { '1': { text: base }, '2': { text: local }, '3': { text: server } }, merge: api.mergeNote(base, local, server) };
+  let resolved; const actions = [];
+  const plugin = { review: [entry], async runAction(action, options) { actions.push(action); if (action === 'resolve') { resolved = options; this.review = []; } return true; }, async syncVault() { actions.push('sync'); } };
   const modal = new ui.ConflictReviewModal({}, plugin); await modal.render();
-  const flatten = el => [el, ...el.children.flatMap(flatten)];
-  const input = flatten(modal.contentEl).find(el => el.tag === 'textarea');
-  const save = buttons.find(b => b.text === 'Save merged result');
-  assert.equal(save.disabled, true); assert.equal(input.disabled, true);
-  assert.ok(input.value.includes('LOCAL')); assert.ok(input.value.includes('SERVER'));
-  await buttons.find(b => b.text === 'Keep server section').callback();
-  assert.equal(save.disabled, false); assert.equal(input.disabled, false);
-  assert.equal(input.value, 'LOCAL\ncontext\nright\ncontext two\nSERVER\n');
-  await save.callback();
-  assert.equal(resolved.choice, 'merged'); assert.equal(resolved.content, input.value);
+  const text = el => [el.textContent, ...el.children.flatMap(text)].join('\n');
+  const shown = text(modal.contentEl);
+  for (const expected of ['demo', 'Nothing is lost', 'both changed the same lines', 'Before', 'This computer', 'Other device', 'old', 'left', 'right']) assert.ok(shown.includes(expected), expected);
+  // Lines only one side changed are already combined and never shown as a choice.
+  assert.ok(!shown.includes('LOCAL') || shown.indexOf('LOCAL') > shown.indexOf('Write the result myself'));
+  assert.equal(buttons.filter(b => ['Keep this computer’s', 'Keep other device’s', 'Keep both'].includes(b.text)).length, 3);
+  await buttons.find(b => b.text === 'Keep other device’s').callback();
+  assert.equal(resolved.choice, 'merged');
+  assert.equal(api.renderMerge(entry.merge, resolved.choices), 'LOCAL\ncontext\nright\ncontext two\nSERVER\n');
+  assert.equal(actions.join(','), 'review,resolve,review,sync');
+});
+
+test('conflict card: a deleted note and an attachment each get a plain sentence and whole-file choices', async () => {
+  const { ui, buttons } = load();
+  const plugin = { review: [{ path: 'gone.md', fingerprint: 'f', sides: { '1': { text: 'a' }, '3': { text: 'b' } } }], async runAction() { return true; } };
+  const modal = new ui.ConflictReviewModal({}, plugin); await modal.render();
+  const text = el => [el.textContent, ...el.children.flatMap(text)].join('\n');
+  assert.match(text(modal.contentEl), /You deleted this file on this computer/);
+  assert.ok(buttons.some(b => b.text === 'Keep it deleted') && buttons.some(b => b.text === 'Keep other device’s'));
+  assert.ok(!buttons.some(b => b.text === 'Keep both'));
 });
 
 test('replacement UI shows what will be lost and does not restore before confirmation', async () => {
@@ -78,7 +129,6 @@ test('three-way task merge preserves history, independent edits and task wording
 test('three-way ambiguous edits require choices and retain safe portions in the result', () => {
   const { api } = load();
   for (const [base, local, server] of [
-    ['- [ ] task\n', '- [x] task\n', '- [-] task\n'],
     ['- [ ] task\n', '', '- [x] task\n'],
     ['- [ ] same\n- [ ] same\n', '- [x] same\n- [ ] same\n', '- [ ] renamed\n- [ ] same\n'],
     ['```\n- [ ] example\n```\n', '```\n- [x] example\n```\n', '```\n- [ ] renamed\n```\n'],
@@ -149,9 +199,11 @@ test('manual merge raises guided review; unresolved sections and stale review ca
 
 test('whole-file replacement previews newer content and rejects a stale confirmation', async t => {
   const f = fixture(t), peer = makePeer(f);
-  fs.writeFileSync(path.join(peer, 'today.md'), 'Protected timestamp\n- [ ] shower\n');
-  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(peer, 'today.md'), '- [ ] shower\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Older'); f.git(peer, 'push');
   const { instance } = load({ home: f.dir, vault: f.vault }); await instance.syncVault();
+  fs.writeFileSync(path.join(peer, 'today.md'), 'Protected timestamp\n- [ ] shower\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Server'); f.git(peer, 'push'); await instance.syncVault();
   fs.writeFileSync(path.join(f.vault, 'today.md'), '- [x] shower\nNew journal\n');
   assert.equal(await instance.syncVault(), false);
   const fingerprint = instance.attention.fingerprint;
@@ -208,6 +260,34 @@ test('historical replacement rejects an edited file and retains binary whole-fil
   assert.equal(instance.recoveryPreview.blocks, null);
   assert.equal(await instance.runAction('restore-history', { path: 'binary.dat', oid, fingerprint: instance.recoveryPreview.fingerprint, confirmReplacement: true }), true, instance.feedback);
   assert.deepEqual(fs.readFileSync(path.join(f.vault, 'binary.dat')), Buffer.from([0, 1, 2]));
+});
+
+test('settings changed on both devices combine silently; a wording clash leaves no conflict markers in the note', async t => {
+  const f = fixture(t), peer = makePeer(f);
+  fs.mkdirSync(path.join(peer, '.obsidian'), { recursive: true });
+  fs.writeFileSync(path.join(peer, '.obsidian', 'app.json'), '{\n  "fontSize": 16,\n  "theme": "dark"\n}\n');
+  fs.writeFileSync(path.join(peer, 'plan.md'), '# Plan\nMeet at 3pm\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Base'); f.git(peer, 'push');
+  const { instance } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  fs.writeFileSync(path.join(peer, '.obsidian', 'app.json'), '{\n  "fontSize": 18,\n  "theme": "dark"\n}\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Peer settings'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, '.obsidian', 'app.json'), '{\n  "fontSize": 16,\n  "theme": "light",\n  "spell": true\n}\n');
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(instance.attention, null);
+  assert.equal(JSON.stringify(JSON.parse(f.git(f.remote, 'show', 'main:.obsidian/app.json'))), JSON.stringify({ fontSize: 18, theme: 'light', spell: true }));
+  f.git(peer, 'pull');
+  fs.writeFileSync(path.join(peer, 'plan.md'), '# Plan\nMeet at 4pm\n');
+  f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Peer plan'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(f.vault, 'plan.md'), '# Plan\nMeet at 5pm\n');
+  assert.equal(await instance.syncVault(), false);
+  assert.equal(instance.attention.kind, 'conflicts');
+  assert.equal(fs.readFileSync(path.join(f.vault, 'plan.md'), 'utf8'), '# Plan\nMeet at 5pm\n');
+  assert.equal(await instance.runAction('review'), true, instance.feedback);
+  const entry = instance.review[0];
+  assert.equal(await instance.runAction('resolve', { path: entry.path, fingerprint: entry.fingerprint, choice: 'merged', choices: { [entry.merge.blocks.find(b => b.conflict).id]: 'server' } }), true, instance.feedback);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(f.git(f.remote, 'show', 'main:plan.md'), '# Plan\nMeet at 4pm');
 });
 
 function load({ home, vault, platform = process.platform, mobile = false, execute } = {}) {
@@ -797,16 +877,15 @@ test('file history recovery restores selected bytes and protects current edits w
 
 test('protection survives unrelated syncs, additive commits and restart; partial text loss needs exact approval', async t => {
   const f = fixture(t); const peer = makePeer(f);
+  let { instance } = load({ home: f.dir, vault: f.vault });
   fs.writeFileSync(path.join(peer, 'note.md'), 'original\nFinished practices at 12:00\n');
   f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Practice time'); f.git(peer, 'push');
-  let { instance } = load({ home: f.dir, vault: f.vault });
   assert.equal(await instance.syncVault(), true, instance.feedback);
   fs.writeFileSync(path.join(peer, 'unrelated.md'), 'another note\n');
   f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Unrelated'); f.git(peer, 'push');
   assert.equal(await instance.syncVault(), true, instance.feedback);
   ({ instance } = load({ home: f.dir, vault: f.vault }));
-  fs.appendFileSync(path.join(f.vault, 'note.md'), 'New checkbox completed\n');
-  assert.equal(await instance.syncVault(), true, instance.feedback);
+  // The older version comes back with new typing on top: a stale overwrite.
   fs.writeFileSync(path.join(f.vault, 'note.md'), 'original\nNew checkbox completed\n');
   assert.equal(await instance.syncVault(), false);
   assert.ok(instance.attention.details[0].removed.includes('Finished practices at 12:00'));
@@ -864,8 +943,6 @@ test('selective recovery restores a timestamp while retaining newer checkboxes a
 
 test('strict text protection handles repeated lines, Unicode, reordering, CRLF and final newlines', () => {
   const { api } = load();
-  assert.equal(api.missingLines('a\na\n🧘\n', 'a\n🧘').length, 1);
-  assert.equal(api.missingLines('a\nb\n', 'b\r\na').length, 0);
   for (const [current, old] of [['a\na\n🧘\nend', 'a\n🧘\ntime\na\nend\n'], ['', 'text'], ['text', '']]) {
     const blocks = api.recoveryBlocks(current, old);
     assert.equal(api.renderRecovery(blocks, new Set()), current);
@@ -892,7 +969,7 @@ test('invalid protected Markdown requires review and renamed notes cannot silent
   fs.writeFileSync(path.join(peer, 'note.md'), 'received text\n'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Received'); f.git(peer, 'push');
   const { instance } = load({ home: f.dir, vault: f.vault }); await instance.syncVault();
   fs.writeFileSync(path.join(f.vault, 'note.md'), Buffer.from([0xff]));
-  assert.equal(await instance.syncVault(), false); assert.match(instance.attention.details[0].reason, /could not be assessed/);
+  assert.equal(await instance.syncVault(), false); assert.match(instance.attention.details[0].reason, /could not be read safely/);
   fs.writeFileSync(path.join(f.vault, 'note.md'), 'received text\n');
   f.git(f.vault, 'mv', 'note.md', 'renamed.md');
   assert.equal(await instance.syncVault(), false);
@@ -928,13 +1005,14 @@ test('unexpected-change review shows both versions and explicit actions before a
     async runAction(action) { actions.push(action); return true; }, async syncVault() { actions.push('sync'); } };
   const modal = new ui.DeletionReviewModal({}, plugin); await modal.render();
   const text = el => [el.textContent, ...el.children.flatMap(text)].join('\n');
-  assert.match(text(modal.contentEl), /Saved copy · before this edit/);
-  assert.match(text(modal.contentEl), /Your current note · on this computer/);
+  assert.match(text(modal.contentEl), /From your other device/);
+  assert.match(text(modal.contentEl), /On this computer now/);
   assert.match(text(modal.contentEl), /ordered; arriving tomorrow/);
   assert.ok(buttons.some(b => b.text === 'Merge versions…'));
   assert.ok(!buttons.some(b => b.text === 'Apply these changes'));
   assert.deepEqual(actions, ['replacement-preview']);
-  await buttons.find(b => b.text === 'Keep my current note and sync').callback();
+  assert.ok(buttons.some(b => b.text === 'Bring back the other device’s version…'));
+  await buttons.find(b => b.text === 'Keep what’s on this computer').callback();
   assert.deepEqual(actions, ['replacement-preview', 'approve-deletions', 'sync']);
 });
 
@@ -959,8 +1037,10 @@ test('protected merge shows the exact final note and requires every passage choi
 test('protected merge preserves reviewed wording, backs up current bytes and rejects stale review', async t => {
   const f = fixture(t), peer = makePeer(f);
   const saved = '# Today\n- [x] supplies\n';
-  fs.writeFileSync(path.join(peer, 'daily.md'), saved); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Saved note'); f.git(peer, 'push');
+  fs.writeFileSync(path.join(peer, 'daily.md'), '# Today\n- [x] groceries (ordered; arriving tomorrow)\n'); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Older note'); f.git(peer, 'push');
   const { instance, api } = load({ home: f.dir, vault: f.vault });
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  fs.writeFileSync(path.join(peer, 'daily.md'), saved); f.git(peer, 'add', '.'); f.git(peer, 'commit', '-m', 'Saved note'); f.git(peer, 'push');
   assert.equal(await instance.syncVault(), true, instance.feedback);
   const current = '# Today\n- [x] groceries (ordered; arriving tomorrow)\n';
   fs.writeFileSync(path.join(f.vault, 'daily.md'), current);
@@ -989,28 +1069,6 @@ test('protected merge preserves reviewed wording, backs up current bytes and rej
 });
 
 
-test('additive note edits preserve full words, punctuation, duplicate counts and task context', () => {
-  const { api } = load();
-  for (const [saved, current] of [
-    ['- [x] supplies, water\n', '- [x] supplies (ordered; arriving tomorrow), water\n'],
-    ['Morning: practice.\n', 'Morning: gentle practice (done).\n'],
-    ['# Core\n- [ ] practice\n', '# Core\n- [x] gentle practice (done)\nNew journal paragraph.\n'],
-    ['one\ntwo\n', 'New heading\none plus\nnew paragraph\ntwo more\n'],
-    ['🧘 café\r\n', '🧘 café (today)\r\n'],
-    ['_practice_\n', '_practice (done)_\n'],
-    ['# Core\n- [ ] task\n', '# Core today\n- [x] task (done)\n'],
-  ]) assert.equal(api.missingLines(saved, current).length, 0, JSON.stringify({ saved, current }));
-  for (const [saved, current] of [
-    ['cat\n', 'concatenate\n'],
-    ['10 mg\n', '100 mg\n'],
-    ['keep this sentence.\n', 'keep this sentence\n'],
-    ['keep\nkeep\n', 'keep (extra)\n'],
-    ['- [ ] same\n- [ ] same\n', '- [x] same (extra)\n'],
-    ['alpha\nbeta\n', 'alpha beta\n'],
-    ['# First\n- [ ] task\n# Second\n', '# First\n# Second\n- [x] task (extra)\n'],
-  ]) assert.ok(api.missingLines(saved, current).length, JSON.stringify({ saved, current }));
-});
-
 for (const action of ['sync', 'merge', 'helper']) test(`${action}: additive edits to received text save without review`, async t => {
   const f = fixture(t), peer = makePeer(f);
   const saved = '# Core\n- [ ] supplies, water\nJournal: practice.\n';
@@ -1029,11 +1087,12 @@ for (const action of ['sync', 'merge', 'helper']) test(`${action}: additive edit
   }
   assert.equal(fs.readFileSync(path.join(f.vault, 'daily.md'), 'utf8'), current);
   assert.equal(f.git(f.remote, 'show', 'main:daily.md'), current.trim());
-  // Adding unrelated text must never excuse removing protected wording.
-  fs.writeFileSync(path.join(f.vault, 'daily.md'), current.replace('supplies', 'groceries') + 'Another paragraph.\n');
-  assert.equal(await instance.syncVault(), false);
-  assert.equal(instance.attention.kind, 'deletions');
-  assert.equal(f.git(f.remote, 'show', 'main:daily.md'), current.trim());
+  // Rewording a received line is ordinary editing: it saves with no review.
+  const reworded = current.replace('supplies', 'groceries') + 'Another paragraph.\n';
+  fs.writeFileSync(path.join(f.vault, 'daily.md'), reworded);
+  assert.equal(await instance.syncVault(), true, instance.feedback);
+  assert.equal(instance.attention, null);
+  assert.equal(f.git(f.remote, 'show', 'main:daily.md'), reworded.trim());
 });
 
 test('overlapping additions keep the version containing both sides; replacements still need review', () => {

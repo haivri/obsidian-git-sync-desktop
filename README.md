@@ -90,26 +90,30 @@ working copy is clean, attachments passed verification, and the server has the
 same commit. Offline work stays saved locally and retries with backoff.
 Automatic successes are quiet; a review remains visible until you resolve it.
 
-**Review before syncing** shows the saved copy beside your current note, with
-changed text highlighted. Additive edits sync automatically when all saved wording remains present.
-Removed or replaced text still opens this review, even without a Git merge conflict. **Keep my current note and sync** preserves your
-current text. **Merge versions…** lets you choose each changed passage and edit
-the complete final note before **Save this merged note and sync**. Nothing is
-changed by opening either preview. Older-copy replacement is a separate,
-explicitly labeled option. Reviews reject stale choices if files change.
+Edits sync without questions whenever nothing is lost; the full rules are in
+[SYNC_RULES.md](SYNC_RULES.md). Rewording, ticking, deleting a few lines or
+moving tasks in a note that came from another device simply saves. Edits made
+on both devices combine automatically when they touch different lines, when one
+ticks a task and the other rewords it, when both add lines at the same place,
+and for Obsidian settings (key by key, newer value on a clash).
 
-**Review your files** lists the affected files directly. Compare the common
-ancestor, computer, and server previews, inspect differing Obsidian settings,
-choose a version, combine text, or keep both note copies. Markdown drafts retain
-independent edits and provide choices for each conflicting section. Resolve all
-sections, review the full editable result, then save. Settings keep one active configuration. Finish
-with **Save and finish syncing**. A choice is rejected if the file changed while
-you were reading it. Git tools remain available separately.
+**Your choice is needed** appears only when both devices reworded the same
+line, one deleted a note the other edited, or an attachment changed on both.
+One card names the note, says what happened, and shows the text before, on this
+computer and on the other device with the changed words marked. Choose **Keep
+this computer’s**, **Keep other device’s** or **Keep both**; the last choice
+saves and uploads by itself. **Write the result myself** opens an editor, and
+**Decide later** changes nothing. The note never shows conflict markers. When
+an automatic sync pauses, one notice offers **Choose now**.
+
+**Check this before it is saved** appears when a note goes back to an older
+version, loses most of its text, a received file is deleted, or many files are
+deleted at once. Keep what is on this computer, bring back the other device's
+version after a preview, or use **Merge versions…** to pick passages.
 
 Both integration parents are protected in local Git history. Incoming notes
-that suddenly disappear or revert, and large deletion batches (20 files, or
-5 files comprising at least 20% of tracked files), stop for exact approval or
-restoration. **Recover previous work** restores an individual historical file
+that are deleted or go back to an older version, and large deletion batches (20
+files, or 5 files comprising at least 20% of tracked files), stop for a check. **Recover previous work** restores an individual historical file
 and protects its current bytes first; restoration does not upload by itself.
 These local restore points complement an independent backup.
 
@@ -214,6 +218,9 @@ Bug reports are welcome in this repository’s issue tracker when available. Inc
 
 
 ## Text protection and selective recovery (1.6.0)
+
+The review rules in this section were replaced in 1.8.0 by
+[SYNC_RULES.md](SYNC_RULES.md); the recovery tools described here are unchanged.
 
 Incoming Markdown remains protected per note across unrelated syncs, no-op checks,
 restarts, and additive saves. Removing or replacing protected text pauses saving
